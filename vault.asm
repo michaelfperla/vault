@@ -36,9 +36,14 @@ BITS 64
 %define SYS_FSTAT      5
 
 %define SESSION_TIMEOUT 300     ; 5 minutes default
-%define SESSION_KEY_SIZE 32
-%define SESSION_SALT_SIZE 16
-; Session file stores: salt(16) + encrypted_key(32) = 48 bytes
+%define SESSION_EXPIRY_OFFSET       0
+%define SESSION_VAULT_HMAC_OFFSET   8
+%define SESSION_KEYFILE_FLAG_OFFSET 40
+%define SESSION_KEYFILE_HASH_OFFSET 41
+%define SESSION_KEY_OFFSET          73
+%define SESSION_FILE_SIZE          105
+; Session file stores:
+;   expiry(8) + vault_hmac(32) + keyfile_flag(1) + keyfile_hash(32) + derived_key(32)
 
 ; ── File flags ───────────────────────────────────────────────
 %define O_RDONLY    0
@@ -184,6 +189,7 @@ cmd_unlock:     db "unlock", 0
 cmd_lock:       db "lock", 0
 cmd_hidden:     db "hidden", 0
 cmd_migrate:    db "migrate", 0
+cmd_help:       db "help", 0
 msg_migrate_ok: db "Vault migrated to new format (with TOTP field).", 10, 0
 msg_migrating:  db "Migrating entry: ", 0
 cmd_test_sha:   db "test-sha256", 0
@@ -203,25 +209,67 @@ prompt_cur_url:     db "  URL [", 0
 prompt_cur_note:    db "  Notes [", 0
 prompt_cur_totp:    db "  TOTP [", 0
 prompt_close:       db "]: ", 0
+prompt_empty:       db 0
 
 ; ── Messages ─────────────────────────────────────────────────
-msg_usage:      db "Usage: vault [--keyfile <path>] [--vault <name>] <command> [args]", 10
-                db "Commands: init, add, get, list, gen, rm, export, import,", 10
-                db "          show, search, count, edit, clip, totp, verify, backup,", 10
-                db "          wipe, unlock, lock, hidden, migrate", 10, 0
+msg_usage:      db "Vault — local terminal password manager", 10, 10
+                db "Usage:", 10
+                db "  vault [--keyfile <path>] [--vault <name>] <command> [args]", 10
+                db "  vault [--vault-path <path>] <command> [args]", 10, 10
+                db "Getting Started:", 10
+                db "  init, add, get, clip, backup", 10, 10
+                db "Daily Use:", 10
+                db "  add, get, show, list, search, edit, gen, clip, totp", 10, 10
+                db "Safety and Recovery:", 10
+                db "  verify, backup, help", 10, 10
+                db "Import / Export:", 10
+                db "  import, export, migrate", 10, 10
+                db "Advanced / Dangerous:", 10
+                db "  hidden, wipe, lock, unlock", 10, 10
+                db "Notes:", 10
+                db "  unlock caches the derived key for 5 minutes (mode 0600).", 10
+                db "  use --vault-path to test or script without touching ~/.vault.", 10, 0
+msg_help_init:  db "vault init", 10
+                db "  Create a new vault at the selected path.", 10
+                db "  Example: vault --vault-path /tmp/demo.enc init", 10
+                db "  Non-interactive: printf 'secret\n' | vault init --password-stdin", 10, 0
+msg_help_add:   db "vault add <name>", 10
+                db "  Add an entry interactively or with explicit field flags.", 10
+                db "  Example: vault add github", 10
+                db "  Scripted: printf 'master\nentrypass\n' | vault add github --username alice --password-stdin --url https://example.com", 10, 0
+msg_help_get:   db "vault get <name> [field]", 10
+                db "  Retrieve one field or print the whole entry.", 10
+                db "  Example: vault get github password", 10
+                db "  Tip: use 'vault search <term>' if you forgot the exact name.", 10, 0
+msg_help_backup: db "vault backup", 10
+                 db "  Create a timestamped backup next to the current vault file.", 10
+                 db "  Example: vault backup", 10, 0
+msg_help_verify: db "vault verify", 10
+                 db "  Recompute and verify the vault HMAC before risky operations.", 10
+                 db "  Example: vault verify", 10, 0
+msg_help_unknown: db "No detailed help for that topic yet. Try: init, add, get, backup, verify.", 10, 0
+msg_output_opt: db "Error: unsupported output option. Use --raw or --json.", 10, 0
+msg_output_conflict: db "Error: choose only one output mode: --raw or --json.", 10, 0
 msg_init_ok:    db "Vault created at ~/.vault/vault.enc", 10, 0
 msg_init_exist: db "Error: vault already exists. Delete ~/.vault/vault.enc to reinitialize.", 10, 0
-msg_no_vault:   db "Error: no vault found. Run 'vault init' first.", 10, 0
+msg_no_vault:   db "Error: no vault found at the selected path.", 10
+                db "Next: run 'vault init' or use --vault-path/--vault to select the right vault.", 10, 0
 msg_mismatch:   db "Error: passwords do not match.", 10, 0
 msg_added:      db "Entry added.", 10, 0
 msg_removed:    db "Entry removed.", 10, 0
-msg_not_found:  db "Error: entry not found.", 10, 0
+msg_not_found:  db "Error: entry not found.", 10
+                db "Next: run 'vault list' or 'vault search <term>' to find the entry name.", 10, 0
 msg_exists:     db "Error: entry already exists.", 10, 0
 msg_no_name:    db "Error: name required.", 10, 0
+msg_init_opt:   db "Error: unsupported init option. Try 'vault help init'.", 10, 0
+msg_add_opt:    db "Error: unsupported add option. Try 'vault help add'.", 10, 0
+msg_opt_value:  db "Error: option requires a value.", 10, 0
 msg_imported:   db " entries imported.", 10, 0
 msg_empty:      db "Vault is empty.", 10, 0
 msg_generated:  db "Generated password stored.", 10, 0
-msg_hmac_fail:  db "Error: HMAC verification failed. Wrong password or corrupted vault.", 10, 0
+msg_hmac_fail:  db "Error: vault could not be opened.", 10
+                db "Likely causes: wrong password, wrong key file, or corrupted vault data.", 10
+                db "Next: retry credentials, verify the selected path, or restore from backup.", 10, 0
 msg_updated:    db "Entry updated.", 10, 0
 msg_entries:    db " entries", 10, 0
 msg_no_match:   db "No matches found.", 10, 0
@@ -237,7 +285,7 @@ msg_verify_ok:  db "Vault integrity verified. HMAC OK.", 10, 0
 msg_backup_ok:  db "Backup created: ", 0
 msg_totp_code:  db "TOTP: ", 0
 msg_totp_none:  db "Error: no TOTP secret stored for this entry.", 10, 0
-msg_totp_hint:  db "Use 'vault edit <name>' and add TOTP secret as notes field (base32).", 10, 0
+msg_totp_hint:  db "Next: run 'vault edit <name>' and add the TOTP secret in the dedicated TOTP field.", 10, 0
 msg_wipe_confirm: db "Type 'DESTROY' to permanently wipe the vault: ", 0
 msg_wipe_ok:    db "Vault securely wiped.", 10, 0
 msg_wipe_abort: db "Wipe aborted.", 10, 0
@@ -245,11 +293,19 @@ msg_mlock_ok:   db 0    ; silent
 wipe_confirm:   db "DESTROY", 0
 keyfile_flag:   db "--keyfile", 0
 argon2_flag:    db "--argon2", 0
+password_stdin_flag: db "--password-stdin", 0
+username_flag:  db "--username", 0
+url_flag:       db "--url", 0
+notes_flag:     db "--notes", 0
+totp_flag:      db "--totp", 0
+raw_flag:       db "--raw", 0
+json_flag:      db "--json", 0
 msg_argon2_init: db "Vault created with Argon2id (16 MiB, 3 iterations).", 10, 0
 msg_argon2_kdf:  db 0   ; silent marker
 
 %define VAULT_VERSION_ARGON2 0x0002
 vault_flag:     db "--vault", 0
+vault_path_flag: db "--vault-path", 0
 vault_dir_fmt:  db "/.vault-", 0     ; HOME + /.vault-<name>/vault.enc
 msg_keyfile_loaded: db "Key file loaded.", 10, 0
 field_totp:     db "totp", 0
@@ -262,6 +318,9 @@ msg_unlocked:   db "Vault unlocked. Session expires in 5 minutes.", 10, 0
 msg_locked:     db "Vault locked. Session cleared.", 10, 0
 msg_no_session: db "No active session.", 10, 0
 msg_session_active: db "Session active. Using cached key.", 10, 0
+msg_session_write_fail: db "Error: could not write session cache.", 10, 0
+msg_keyfile_required: db "Error: key file missing, unreadable, or empty.", 10
+                      db "Next: verify the --keyfile path and file contents, then retry.", 10, 0
 session_path_prefix: db "/tmp/.vault-session-", 0
 
 ; ── Hidden vault messages ────────────────────────────────────
@@ -271,6 +330,17 @@ msg_hidden_add:     db "Entry added to hidden vault.", 10, 0
 msg_hidden_usage:   db "Usage: vault hidden <init|add|get|list|rm> [args]", 10, 0
 msg_hidden_empty:   db "Hidden vault is empty.", 10, 0
 hidden_marker:  db "NYXHIDE", 0
+
+json_ok_true:   db '{', '"', 'o', 'k', '"', ':', 't', 'r', 'u', 'e', '}', 10, 0
+json_empty_arr: db "[]", 10, 0
+json_key_count: db "count", 0
+json_key_code:  db "code", 0
+msg_ok_raw:     db "ok", 10, 0
+json_escape_quote: db 92, 34, 0
+json_escape_bs:    db 92, 92, 0
+json_escape_n:     db 92, 'n', 0
+json_escape_r:     db 92, 'r', 0
+json_escape_t:     db 92, 't', 0
 
 ; Hidden vault sub-commands
 hid_init_str:   db "init", 0
@@ -395,7 +465,7 @@ vault_name:     resb 64         ; --vault name (for multi-vault)
 
 ; ── Session management ───────────────────────────────────────
 session_path:   resb 128        ; /tmp/.vault-session-<uid>
-session_buf:    resb 64         ; session file buffer
+session_buf:    resb 128        ; session file buffer
 session_active: resb 1          ; 1 if session key loaded from file
 
 ; ── Hidden vault ─────────────────────────────────────────────
@@ -442,12 +512,20 @@ buf:            resb BUF_SIZE
 input_buf:      resb 512
 master_pw:      resb 256
 master_pw2:     resb 256
+init_pw_from_stdin: resb 1
+output_raw:     resb 1
+output_json:    resb 1
 entry_name:     resb MAX_NAME_LEN
 entry_user:     resb MAX_FIELD_LEN
 entry_pass:     resb MAX_FIELD_LEN
 entry_url:      resb MAX_FIELD_LEN
 entry_notes:    resb MAX_FIELD_LEN
 entry_totp:     resb MAX_FIELD_LEN
+add_user_provided: resb 1
+add_url_provided:  resb 1
+add_notes_provided: resb 1
+add_totp_provided: resb 1
+add_pw_from_stdin: resb 1
 entry_data:     resb MAX_ENTRY_DATA
 crypt_buf:      resb MAX_ENTRY_DATA
 hex_out:        resb 128
@@ -493,7 +571,7 @@ _start:
     ; Check argc >= 2
     mov rax, [rel argc]
     cmp rax, 2
-    jl .show_usage
+    jl show_usage
 
     ; Check for --argon2 flag (no-arg flag, just shifts by 1)
     mov byte [rel argon2_use_argon2], 0
@@ -524,7 +602,7 @@ _start:
     ; --keyfile mode: need argc >= 4 (prog --keyfile path cmd)
     mov rax, [rel argc]
     cmp rax, 4
-    jl .show_usage
+    jl show_usage
 
     ; Save keyfile path
     mov rax, [rel argv]
@@ -553,7 +631,7 @@ _start:
     ; --vault mode: need argc >= 4
     mov rax, [rel argc]
     cmp rax, 4
-    jl .show_usage
+    jl show_usage
 
     ; Save vault name and rebuild path
     mov rax, [rel argv]
@@ -572,6 +650,34 @@ _start:
     add rax, 16
     mov [rel argv], rax
 .no_vault_flag:
+
+    ; Check for --vault-path flag: vault --vault-path /path/to/vault.enc <command> [args]
+    mov rax, [rel argv]
+    mov rdi, [rax+8]        ; argv[1]
+    lea rsi, [rel vault_path_flag]
+    call strcmp
+    test eax, eax
+    jnz .no_vault_path_flag
+
+    ; --vault-path mode: need argc >= 4
+    mov rax, [rel argc]
+    cmp rax, 4
+    jl show_usage
+
+    ; Override vault_path directly
+    mov rax, [rel argv]
+    mov rsi, [rax+16]       ; argv[2] = vault path
+    lea rdi, [rel vault_path]
+    call strcpy
+
+    ; Shift argv
+    mov rax, [rel argc]
+    sub rax, 2
+    mov [rel argc], rax
+    mov rax, [rel argv]
+    add rax, 16
+    mov [rel argv], rax
+.no_vault_path_flag:
 
     ; Load config file (sets config_gen_len)
     call load_config
@@ -733,8 +839,84 @@ _start:
     test eax, eax
     jz do_migrate
 
-.show_usage:
+    lea rsi, [rel cmd_help]
+    mov rdi, [rel argv]
+    mov rdi, [rdi+8]
+    call strcmp
+    test eax, eax
+    jz do_help
+
+show_usage:
     lea rdi, [rel msg_usage]
+    call print_str
+    xor edi, edi
+    call exit
+
+do_help:
+    mov rax, [rel argv]
+    mov rdi, [rax+16]       ; argv[2] = help topic
+    test rdi, rdi
+    jz show_usage
+
+    lea rsi, [rel cmd_init]
+    call strcmp
+    test eax, eax
+    jnz .help_add
+    lea rdi, [rel msg_help_init]
+    call print_str
+    xor edi, edi
+    call exit
+
+.help_add:
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel cmd_add]
+    call strcmp
+    test eax, eax
+    jnz .help_get
+    lea rdi, [rel msg_help_add]
+    call print_str
+    xor edi, edi
+    call exit
+
+.help_get:
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel cmd_get]
+    call strcmp
+    test eax, eax
+    jnz .help_backup
+    lea rdi, [rel msg_help_get]
+    call print_str
+    xor edi, edi
+    call exit
+
+.help_backup:
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel cmd_backup]
+    call strcmp
+    test eax, eax
+    jnz .help_verify
+    lea rdi, [rel msg_help_backup]
+    call print_str
+    xor edi, edi
+    call exit
+
+.help_verify:
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel cmd_verify]
+    call strcmp
+    test eax, eax
+    jnz .help_unknown
+    lea rdi, [rel msg_help_verify]
+    call print_str
+    xor edi, edi
+    call exit
+
+.help_unknown:
+    lea rdi, [rel msg_help_unknown]
     call print_str
     xor edi, edi
     call exit
@@ -781,6 +963,77 @@ build_vault_path:
     add rbx, 8
     jmp .env_loop
 .env_done:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; try_env_pass — check VAULT_PASS environment variable
+;   If found, copies value to master_pw buffer
+;   Returns: eax = 1 if found, 0 if not
+; ════════════════════════════════════════════════════════════════
+try_env_pass:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov rax, [rel argc]
+    mov rbx, [rel argv]
+    lea rbx, [rbx + rax*8 + 8]   ; envp = argv + argc + 1
+.tep_loop:
+    mov rdi, [rbx]
+    test rdi, rdi
+    jz .tep_notfound
+    ; Check "VAULT_PASS="
+    cmp byte [rdi],   'V'
+    jne .tep_next
+    cmp byte [rdi+1], 'A'
+    jne .tep_next
+    cmp byte [rdi+2], 'U'
+    jne .tep_next
+    cmp byte [rdi+3], 'L'
+    jne .tep_next
+    cmp byte [rdi+4], 'T'
+    jne .tep_next
+    cmp byte [rdi+5], '_'
+    jne .tep_next
+    cmp byte [rdi+6], 'P'
+    jne .tep_next
+    cmp byte [rdi+7], 'A'
+    jne .tep_next
+    cmp byte [rdi+8], 'S'
+    jne .tep_next
+    cmp byte [rdi+9], 'S'
+    jne .tep_next
+    cmp byte [rdi+10], '='
+    jne .tep_next
+    ; Found — copy value after '=' to master_pw
+    lea rsi, [rdi+11]
+    lea rdi, [rel master_pw]
+    xor ecx, ecx
+.tep_copy:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .tep_found
+    inc ecx
+    cmp ecx, 255
+    jl .tep_copy
+    mov byte [rdi + 255], 0
+.tep_found:
+    mov eax, 1
+    jmp .tep_ret
+.tep_next:
+    add rbx, 8
+    jmp .tep_loop
+.tep_notfound:
+    xor eax, eax
+.tep_ret:
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rbx
@@ -2915,6 +3168,32 @@ cmd_test_sha256:
 
 ; ── vault init ───────────────────────────────────────────────
 do_init:
+    mov byte [rel init_pw_from_stdin], 0
+
+    ; Parse init options: only --password-stdin is supported
+    mov rcx, 2
+.init_opt_loop:
+    mov rax, [rel argc]
+    cmp rcx, rax
+    jge .init_opts_done
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel password_stdin_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .init_bad_opt
+    mov byte [rel init_pw_from_stdin], 1
+    inc rcx
+    jmp .init_opt_loop
+.init_bad_opt:
+    lea rdi, [rel msg_init_opt]
+    call print_str
+    mov edi, 1
+    call exit
+.init_opts_done:
+
     ; Check if vault file already exists
     lea rdi, [rel vault_path]
     call file_exists
@@ -2937,6 +3216,23 @@ do_init:
     add rdi, rax
     mov byte [rdi], '/'     ; restore
 
+    cmp byte [rel init_pw_from_stdin], 0
+    je .init_prompt_passwords
+
+    ; Non-interactive init: read one password line from stdin and reuse it as confirmation
+    lea rdi, [rel prompt_empty]
+    lea rsi, [rel master_pw]
+    mov edx, 255
+    call read_line
+    push rax
+    lea rsi, [rel master_pw]
+    lea rdi, [rel master_pw2]
+    call strcpy
+    pop rcx
+    push rcx
+    jmp .init_compare
+
+.init_prompt_passwords:
     ; Read master password
     lea rdi, [rel prompt_master]
     lea rsi, [rel master_pw]
@@ -2952,6 +3248,7 @@ do_init:
     mov rcx, rax            ; confirm length
 
     ; Compare
+.init_compare:
     pop rax                 ; pw length
     cmp rax, rcx
     jne .init_mismatch
@@ -3154,16 +3451,20 @@ err_list_empty:
 
 ; ── vault list ───────────────────────────────────────────────
 do_list:
-    ; Read vault file
-    call read_vault_file    ; rax = bytes read, data in vault_buf
-    test rax, rax
-    jz err_no_vault
+    mov edi, 2
+    call parse_output_flags
+
+    ; Open vault (requires master password, verifies HMAC)
+    call open_vault
 
     ; Parse entry count at offset 62
     lea rsi, [rel vault_buf]
     mov eax, [rsi + 62]
     test eax, eax
-    jz err_list_empty
+    jz .list_empty
+
+    cmp byte [rel output_json], 0
+    jne .list_json
 
     mov ecx, eax            ; entry count
     lea rsi, [rel vault_buf]
@@ -3201,6 +3502,58 @@ do_list:
     jmp .list_loop
 
 .list_done:
+.list_exit:
+    xor edi, edi
+    call exit
+
+.list_empty:
+    cmp byte [rel output_json], 0
+    je err_list_empty
+    lea rdi, [rel json_empty_arr]
+    call print_str
+    xor edi, edi
+    call exit
+
+.list_json:
+    mov r12d, eax
+    mov al, '['
+    call print_char
+    lea rbx, [rel vault_buf]
+    add rbx, 66
+    mov r15d, 1
+.list_json_loop:
+    test r12d, r12d
+    jz .list_json_done
+    mov eax, [rbx]          ; name_len
+    mov r13d, eax
+    lea rsi, [rbx + 4]
+    lea rdi, [rel entry_name]
+    mov ecx, r13d
+    rep movsb
+    mov byte [rdi], 0
+
+    cmp r15d, 1
+    je .list_json_emit
+    mov al, ','
+    call print_char
+.list_json_emit:
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov r15d, 0
+
+    add rbx, 4
+    add rbx, r13
+    mov eax, [rbx]          ; encrypted data length
+    add rbx, 4
+    add rbx, IV_LEN
+    add rbx, rax
+    dec r12d
+    jmp .list_json_loop
+.list_json_done:
+    mov al, ']'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
     xor edi, edi
     call exit
 
@@ -3217,6 +3570,152 @@ do_add:
     lea rdi, [rel entry_name]
     call strcpy
 
+    ; Reset staged field state and parse add options
+    lea rdi, [rel entry_user]
+    mov ecx, MAX_FIELD_LEN
+    call zero_mem
+    lea rdi, [rel entry_pass]
+    mov ecx, MAX_FIELD_LEN
+    call zero_mem
+    lea rdi, [rel entry_url]
+    mov ecx, MAX_FIELD_LEN
+    call zero_mem
+    lea rdi, [rel entry_notes]
+    mov ecx, MAX_FIELD_LEN
+    call zero_mem
+    lea rdi, [rel entry_totp]
+    mov ecx, MAX_FIELD_LEN
+    call zero_mem
+    mov byte [rel add_user_provided], 0
+    mov byte [rel add_url_provided], 0
+    mov byte [rel add_notes_provided], 0
+    mov byte [rel add_totp_provided], 0
+    mov byte [rel add_pw_from_stdin], 0
+
+    mov rcx, 3
+.add_opt_loop:
+    mov rax, [rel argc]
+    cmp rcx, rax
+    jge .add_opts_done
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+
+    lea rsi, [rel password_stdin_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .check_username
+    mov byte [rel add_pw_from_stdin], 1
+    inc rcx
+    jmp .add_opt_loop
+
+.check_username:
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel username_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .check_url
+    mov rax, [rel argc]
+    lea rdx, [rcx + 1]
+    cmp rdx, rax
+    jge .add_missing_value
+    mov rax, [rel argv]
+    mov rsi, [rax + rdx*8]
+    lea rdi, [rel entry_user]
+    push rcx
+    call strcpy
+    pop rcx
+    mov byte [rel add_user_provided], 1
+    add rcx, 2
+    jmp .add_opt_loop
+
+.check_url:
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel url_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .check_notes
+    mov rax, [rel argc]
+    lea rdx, [rcx + 1]
+    cmp rdx, rax
+    jge .add_missing_value
+    mov rax, [rel argv]
+    mov rsi, [rax + rdx*8]
+    lea rdi, [rel entry_url]
+    push rcx
+    call strcpy
+    pop rcx
+    mov byte [rel add_url_provided], 1
+    add rcx, 2
+    jmp .add_opt_loop
+
+.check_notes:
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel notes_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .check_totp
+    mov rax, [rel argc]
+    lea rdx, [rcx + 1]
+    cmp rdx, rax
+    jge .add_missing_value
+    mov rax, [rel argv]
+    mov rsi, [rax + rdx*8]
+    lea rdi, [rel entry_notes]
+    push rcx
+    call strcpy
+    pop rcx
+    mov byte [rel add_notes_provided], 1
+    add rcx, 2
+    jmp .add_opt_loop
+
+.check_totp:
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel totp_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jnz .add_bad_opt
+    mov rax, [rel argc]
+    lea rdx, [rcx + 1]
+    cmp rdx, rax
+    jge .add_missing_value
+    mov rax, [rel argv]
+    mov rsi, [rax + rdx*8]
+    lea rdi, [rel entry_totp]
+    push rcx
+    call strcpy
+    pop rcx
+    mov byte [rel add_totp_provided], 1
+    add rcx, 2
+    jmp .add_opt_loop
+
+.add_missing_value:
+    lea rdi, [rel msg_opt_value]
+    call print_str
+    mov edi, 1
+    call exit
+
+.add_bad_opt:
+    lea rdi, [rel msg_add_opt]
+    call print_str
+    mov edi, 1
+    call exit
+
+.add_opts_done:
+
     ; Read vault, verify master password
     call open_vault         ; derives key, verifies HMAC
 
@@ -3226,31 +3725,52 @@ do_add:
     test rax, rax
     jnz err_entry_exists
 
-    ; Read fields
+    ; Read only fields that were not provided as flags
+    cmp byte [rel add_user_provided], 0
+    jne .add_have_username
     lea rdi, [rel prompt_username]
     lea rsi, [rel entry_user]
     mov edx, 255
     call read_line
+.add_have_username:
 
+    cmp byte [rel add_pw_from_stdin], 0
+    je .add_prompt_password
+    lea rdi, [rel prompt_empty]
+    lea rsi, [rel entry_pass]
+    mov edx, 255
+    call read_line
+    jmp .add_have_password
+.add_prompt_password:
     lea rdi, [rel prompt_password]
     lea rsi, [rel entry_pass]
     mov edx, 255
     call read_password
+.add_have_password:
 
+    cmp byte [rel add_url_provided], 0
+    jne .add_have_url
     lea rdi, [rel prompt_url]
     lea rsi, [rel entry_url]
     mov edx, 255
     call read_line
+.add_have_url:
 
+    cmp byte [rel add_notes_provided], 0
+    jne .add_have_notes
     lea rdi, [rel prompt_notes]
     lea rsi, [rel entry_notes]
     mov edx, 255
     call read_line
+.add_have_notes:
 
+    cmp byte [rel add_totp_provided], 0
+    jne .add_have_totp
     lea rdi, [rel prompt_totp]
     lea rsi, [rel entry_totp]
     mov edx, 255
     call read_line
+.add_have_totp:
 
     ; Pack entry data: username\0password\0url\0notes\0totp\0
     call pack_entry_data
@@ -3295,6 +3815,9 @@ do_get:
     lea rdi, [rel entry_name]
     call strcpy
 
+    mov byte [rel output_raw], 0
+    mov byte [rel output_json], 0
+
     call open_vault
 
     ; Find entry (fuzzy)
@@ -3303,19 +3826,51 @@ do_get:
     test rax, rax
     jz err_not_found
 
+    ; Update entry_name to the actual matched name
+    mov rsi, rax
+    mov edx, [rsi]
+    add rsi, 4
+    lea rdi, [rel entry_name]
+    mov ecx, edx
+    rep movsb
+    mov byte [rdi], 0
+
     ; rax = pointer to entry in vault_buf
     ; Decrypt it
     mov rsi, rax
     call decrypt_entry      ; entry_user/pass/url/notes filled
 
     ; Check if field specified (argc >= 4)
+    xor r12d, r12d          ; field pointer
+    mov edi, 3
     mov rax, [rel argc]
     cmp rax, 4
-    jl .get_all
+    jl .get_flags_only
 
-    ; Get field name from argv[3]
     mov rax, [rel argv]
     mov rdi, [rax+24]       ; argv[3]
+    lea rsi, [rel raw_flag]
+    call strcmp
+    test eax, eax
+    jz .get_flags_only
+    mov rax, [rel argv]
+    mov rdi, [rax+24]
+    lea rsi, [rel json_flag]
+    call strcmp
+    test eax, eax
+    jz .get_flags_only
+
+    mov rax, [rel argv]
+    mov r12, [rax+24]       ; field argument
+    mov edi, 4
+
+.get_flags_only:
+    call parse_output_flags
+
+    ; Get field name from argv[3]
+    test r12, r12
+    jz .get_all
+    mov rdi, r12
 
     ; Check which field
     lea rsi, [rel field_username]
@@ -3350,6 +3905,22 @@ do_get:
     jmp .get_all
 
 .get_user:
+    cmp byte [rel output_json], 0
+    je .get_user_plain
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_user]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_user_plain:
     lea rdi, [rel entry_user]
     call print_str
     lea rdi, [rel msg_newline]
@@ -3357,6 +3928,22 @@ do_get:
     jmp .get_done
 
 .get_pass:
+    cmp byte [rel output_json], 0
+    je .get_pass_plain
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_pass]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_pass_plain:
     lea rdi, [rel entry_pass]
     call print_str
     lea rdi, [rel msg_newline]
@@ -3364,6 +3951,22 @@ do_get:
     jmp .get_done
 
 .get_url:
+    cmp byte [rel output_json], 0
+    je .get_url_plain
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_url]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_url_plain:
     lea rdi, [rel entry_url]
     call print_str
     lea rdi, [rel msg_newline]
@@ -3371,6 +3974,22 @@ do_get:
     jmp .get_done
 
 .get_notes:
+    cmp byte [rel output_json], 0
+    je .get_notes_plain
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_notes]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_notes_plain:
     lea rdi, [rel entry_notes]
     call print_str
     lea rdi, [rel msg_newline]
@@ -3378,6 +3997,22 @@ do_get:
     jmp .get_done
 
 .get_totp:
+    cmp byte [rel output_json], 0
+    je .get_totp_plain
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_totp]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_totp_plain:
     lea rdi, [rel entry_totp]
     call print_str
     lea rdi, [rel msg_newline]
@@ -3385,6 +4020,90 @@ do_get:
     jmp .get_done
 
 .get_all:
+    cmp byte [rel output_json], 0
+    je .get_all_check_raw
+    mov al, '{'
+    call print_char
+    lea rdi, [rel entry_name]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    mov al, '{'
+    call print_char
+    lea rdi, [rel field_username]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_user]
+    call print_json_quoted
+    mov al, ','
+    call print_char
+    lea rdi, [rel field_password]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_pass]
+    call print_json_quoted
+    mov al, ','
+    call print_char
+    lea rdi, [rel field_url]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_url]
+    call print_json_quoted
+    mov al, ','
+    call print_char
+    lea rdi, [rel field_notes]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_notes]
+    call print_json_quoted
+    mov al, ','
+    call print_char
+    lea rdi, [rel field_totp]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel entry_totp]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_all_check_raw:
+    cmp byte [rel output_raw], 0
+    je .get_all_plain
+    lea rdi, [rel entry_name]
+    call print_str
+    mov al, 9
+    call print_char
+    lea rdi, [rel entry_user]
+    call print_str
+    mov al, 9
+    call print_char
+    lea rdi, [rel entry_pass]
+    call print_str
+    mov al, 9
+    call print_char
+    lea rdi, [rel entry_url]
+    call print_str
+    mov al, 9
+    call print_char
+    lea rdi, [rel entry_notes]
+    call print_str
+    mov al, 9
+    call print_char
+    lea rdi, [rel entry_totp]
+    call print_str
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .get_done
+.get_all_plain:
     lea rdi, [rel label_name]
     call print_str
     lea rdi, [rel entry_name]
@@ -4151,14 +4870,18 @@ do_search:
     lea rdi, [rel search_term]
     call strcpy
 
-    call read_vault_file
-    test rax, rax
-    jz err_no_vault
+    mov edi, 3
+    call parse_output_flags
+
+    call open_vault
 
     lea rsi, [rel vault_buf]
     mov eax, [rsi + 62]
     test eax, eax
     jz err_list_empty
+
+    cmp byte [rel output_json], 0
+    jne .search_json
 
     mov ecx, eax
     add rsi, 66
@@ -4190,6 +4913,7 @@ do_search:
     call print_n
     lea rdi, [rel msg_newline]
     call print_str
+.search_print_done:
     inc r15d
 
 .search_skip:
@@ -4215,21 +4939,161 @@ do_search:
     xor edi, edi
     call exit
 
+.search_json:
+    mov ecx, [rsi + 62]
+    add rsi, 66
+    lea rbx, [rel buf]
+    mov byte [rbx], '['
+    inc rbx
+    xor r14d, r14d          ; match count
+.search_json_loop:
+    test ecx, ecx
+    jz .search_json_done
+    push rcx
+    push rsi
+
+    mov eax, [rsi]          ; name_len
+    add rsi, 4              ; name data
+    mov r13d, eax
+    mov r12d, eax
+    push rsi
+    lea rdi, [rel search_term]
+    call substr_match
+    pop rsi
+    test eax, eax
+    jz .search_json_skip
+
+    test r14d, r14d
+    jz .search_json_open
+    mov byte [rbx], ','
+    inc rbx
+.search_json_open:
+    mov byte [rbx], '"'
+    inc rbx
+.search_json_copy:
+    test r12d, r12d
+    jz .search_json_close
+    mov al, [rsi]
+    cmp al, '"'
+    je .search_json_quote
+    cmp al, 92
+    je .search_json_bs
+    cmp al, 10
+    je .search_json_n
+    cmp al, 13
+    je .search_json_r
+    cmp al, 9
+    je .search_json_t
+    mov [rbx], al
+    inc rbx
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_quote:
+    mov byte [rbx], 92
+    mov byte [rbx + 1], '"'
+    add rbx, 2
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_bs:
+    mov byte [rbx], 92
+    mov byte [rbx + 1], 92
+    add rbx, 2
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_n:
+    mov byte [rbx], 92
+    mov byte [rbx + 1], 'n'
+    add rbx, 2
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_r:
+    mov byte [rbx], 92
+    mov byte [rbx + 1], 'r'
+    add rbx, 2
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_t:
+    mov byte [rbx], 92
+    mov byte [rbx + 1], 't'
+    add rbx, 2
+    inc rsi
+    dec r12d
+    jmp .search_json_copy
+.search_json_close:
+    mov byte [rbx], '"'
+    inc rbx
+    inc r14d
+
+.search_json_skip:
+    pop rsi
+    mov eax, [rsi]          ; name_len
+    add rsi, 4
+    add rsi, rax
+    mov eax, [rsi]          ; enc_data_len
+    add rsi, 4
+    add rsi, IV_LEN
+    add rsi, rax
+    pop rcx
+    dec ecx
+    jmp .search_json_loop
+.search_json_done:
+    mov byte [rbx], ']'
+    inc rbx
+    mov byte [rbx], 10
+    inc rbx
+    mov byte [rbx], 0
+    lea rdi, [rel buf]
+    call print_str
+    xor edi, edi
+    call exit
+
 ; ── vault count — show total entries ─────────────────────────
 do_count:
-    call read_vault_file
-    test rax, rax
-    jz err_no_vault
+    mov edi, 2
+    call parse_output_flags
+
+    call open_vault
 
     lea rsi, [rel vault_buf]
     mov eax, [rsi + 62]
+    cmp byte [rel output_json], 0
+    je .count_check_raw
+    lea rdi, [rel numbuf]
+    call itoa
+    mov al, '{'
+    call print_char
+    lea rdi, [rel json_key_count]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel numbuf]
+    call print_str
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    xor edi, edi
+    call exit
+.count_check_raw:
     lea rdi, [rel numbuf]
     call itoa
     lea rdi, [rel numbuf]
     call print_str
+    cmp byte [rel output_raw], 0
+    jne .count_done
     lea rdi, [rel msg_entries]
     call print_str
-
+.count_done:
+    cmp byte [rel output_raw], 0
+    je .count_exit
+    lea rdi, [rel msg_newline]
+    call print_str
+.count_exit:
     xor edi, edi
     call exit
 
@@ -4613,9 +5477,26 @@ do_clip:
 
 ; ── vault verify — check vault integrity ─────────────────────
 do_verify:
+    mov edi, 2
+    call parse_output_flags
+
     call open_vault
     ; If we get here, HMAC was verified successfully
     call zero_sensitive
+    cmp byte [rel output_json], 0
+    je .verify_check_raw
+    lea rdi, [rel json_ok_true]
+    call print_str
+    xor edi, edi
+    call exit
+.verify_check_raw:
+    cmp byte [rel output_raw], 0
+    je .verify_plain
+    lea rdi, [rel msg_ok_raw]
+    call print_str
+    xor edi, edi
+    call exit
+.verify_plain:
     lea rdi, [rel msg_verify_ok]
     call print_str
     xor edi, edi
@@ -4701,6 +5582,9 @@ do_totp:
     lea rdi, [rel entry_name]
     call strcpy
 
+    mov edi, 3
+    call parse_output_flags
+
     call open_vault
 
     lea rdi, [rel entry_name]
@@ -4780,19 +5664,38 @@ do_totp:
     ; edx = 6-digit code
 
     ; Print with leading zeros (always 6 digits)
-    push rdx                ; save TOTP code
-    lea rdi, [rel msg_totp_code]
-    call print_str
-    pop rdx
-
     mov eax, edx
     lea rdi, [rel numbuf]
     call itoa_padded6
+
+    cmp byte [rel output_json], 0
+    je .totp_check_raw
+    mov al, '{'
+    call print_char
+    lea rdi, [rel json_key_code]
+    call print_json_quoted
+    mov al, ':'
+    call print_char
+    lea rdi, [rel numbuf]
+    call print_json_quoted
+    mov al, '}'
+    call print_char
+    lea rdi, [rel msg_newline]
+    call print_str
+    jmp .totp_done
+
+.totp_check_raw:
+    cmp byte [rel output_raw], 0
+    jne .totp_raw
+    lea rdi, [rel msg_totp_code]
+    call print_str
+.totp_raw:
     lea rdi, [rel numbuf]
     call print_str
     lea rdi, [rel msg_newline]
     call print_str
 
+.totp_done:
     call zero_sensitive
     xor edi, edi
     call exit
@@ -4888,85 +5791,64 @@ do_wipe:
 
 ; ── vault unlock — cache derived key for session ─────────────
 do_unlock:
-    ; Build session path
+    call open_vault
     call build_session_path
 
-    ; Open vault normally (prompts for password)
-    call open_vault
-
-    ; Generate a session encryption key from random data
-    ; We store the derived_key XOR'd with a random nonce
-    ; Session file format: random_nonce(16) + XOR'd_key(32) = 48 bytes
     lea rdi, [rel session_buf]
-    mov esi, 16
-    call get_random          ; 16-byte nonce
+    mov ecx, 128
+    call zero_mem
 
-    ; XOR derived_key with SHA-256(nonce) to create stored form
-    lea rdi, [rel session_buf]
-    mov esi, 16
-    lea rdx, [rel hidden_salt]  ; reuse as temp hash output
-    call sha256_hash
+    call get_now_seconds
+    add rax, SESSION_TIMEOUT
+    mov [rel session_buf + SESSION_EXPIRY_OFFSET], rax
 
-    ; Copy derived key then XOR with hash
-    lea rdi, [rel session_buf]
-    add rdi, 16
-    lea rsi, [rel derived_key]
-    mov ecx, 32
+    lea rsi, [rel vault_buf + 30]
+    lea rdi, [rel session_buf + SESSION_VAULT_HMAC_OFFSET]
+    mov ecx, HMAC_LEN
     rep movsb
-    ; XOR
-    lea rdi, [rel session_buf]
-    add rdi, 16
-    lea rsi, [rel hidden_salt]
-    mov ecx, 32
-.unlock_xor:
-    mov al, [rsi]
-    xor [rdi], al
-    inc rdi
-    inc rsi
-    dec ecx
-    jnz .unlock_xor
 
-    ; Write session file (mode 0600)
+    mov al, [rel keyfile_active]
+    mov [rel session_buf + SESSION_KEYFILE_FLAG_OFFSET], al
+    test al, al
+    jz .unlock_no_keyfile
+
+    call load_keyfile_hash
+    lea rsi, [rel keyfile_hash]
+    lea rdi, [rel session_buf + SESSION_KEYFILE_HASH_OFFSET]
+    mov ecx, KEY_LEN
+    rep movsb
+
+.unlock_no_keyfile:
+    lea rsi, [rel derived_key]
+    lea rdi, [rel session_buf + SESSION_KEY_OFFSET]
+    mov ecx, KEY_LEN
+    rep movsb
+
     lea rdi, [rel session_path]
     lea rsi, [rel session_buf]
-    mov edx, 48
+    mov edx, SESSION_FILE_SIZE
     mov ecx, 0o600
     call write_file
+    cmp eax, SESSION_FILE_SIZE
+    jne .unlock_write_fail
 
-    ; Fork a background timer to auto-delete after timeout
-    mov eax, SYS_FORK
-    syscall
-    test eax, eax
-    jnz .unlock_parent
-
-    ; Child: become session leader, sleep, then wipe session file
-    mov eax, SYS_SETSID
-    syscall
-
-    sub rsp, 16
-    mov qword [rsp], SESSION_TIMEOUT
-    mov qword [rsp+8], 0
-    mov rdi, rsp
-    xor esi, esi
-    mov eax, SYS_NANOSLEEP
-    syscall
-    add rsp, 16
-
-    ; Wipe session file
-    call wipe_session_file
-    xor edi, edi
-    call exit
-
-.unlock_parent:
-    call zero_sensitive
-    ; Zero session_buf
+    mov byte [rel session_active], 1
     lea rdi, [rel session_buf]
-    mov ecx, 64
+    mov ecx, 128
     call zero_mem
 
     lea rdi, [rel msg_unlocked]
     call print_str
     xor edi, edi
+    call exit
+
+.unlock_write_fail:
+    lea rdi, [rel session_buf]
+    mov ecx, 128
+    call zero_mem
+    lea rdi, [rel msg_session_write_fail]
+    call print_str
+    mov edi, 1
     call exit
 
 ; ── vault lock — clear session ───────────────────────────────
@@ -5467,6 +6349,16 @@ do_hidden_get:
     lea rdi, [rel msg_newline]
     call print_str
 
+    cmp byte [rel entry_totp], 0
+    jz .hidden_get_done
+    lea rdi, [rel label_totp2]
+    call print_str
+    lea rdi, [rel entry_totp]
+    call print_str
+    lea rdi, [rel msg_newline]
+    call print_str
+
+.hidden_get_done:
     call zero_sensitive
     lea rdi, [rel hidden_key]
     mov ecx, 32
@@ -5558,77 +6450,106 @@ build_session_path:
     pop rbx
     ret
 
+; get_now_seconds — current CLOCK_REALTIME seconds
+get_now_seconds:
+    sub rsp, 16
+    xor edi, edi
+    mov rsi, rsp
+    mov eax, SYS_CLOCK_GETTIME
+    syscall
+    mov rax, [rsp]
+    add rsp, 16
+    ret
+
 ; wipe_session_file — securely wipe and delete session file
 wipe_session_file:
     ; Overwrite with zeros
     lea rdi, [rel session_buf]
-    mov ecx, 64
-    xor al, al
-    rep stosb
+    mov ecx, 128
+    call zero_mem
     lea rdi, [rel session_path]
     lea rsi, [rel session_buf]
-    mov edx, 48
+    mov edx, SESSION_FILE_SIZE
     mov ecx, 0o600
     call write_file
     ; Delete
     lea rdi, [rel session_path]
     mov eax, SYS_UNLINK
     syscall
+    mov byte [rel session_active], 0
     ret
 
 ; try_load_session — check for session file and load cached key
 ;   Returns: eax = 1 if session loaded (derived_key set), 0 if not
 try_load_session:
-    push rbx
+    push rcx
+    push rsi
+    push rdi
+
+    mov byte [rel session_active], 0
     call build_session_path
+
+    lea rdi, [rel session_path]
+    lea rsi, [rel session_buf]
+    mov edx, 128
+    call read_file
+    cmp eax, SESSION_FILE_SIZE
+    jne .tls_invalid
+
+    call get_now_seconds
+    cmp rax, [rel session_buf + SESSION_EXPIRY_OFFSET]
+    ja .tls_invalid
+
+    lea rdi, [rel session_buf + SESSION_VAULT_HMAC_OFFSET]
+    lea rsi, [rel vault_buf + 30]
+    mov ecx, HMAC_LEN
+    call memcmp
+    test eax, eax
+    jnz .tls_invalid
+
+    mov al, [rel session_buf + SESSION_KEYFILE_FLAG_OFFSET]
+    cmp al, [rel keyfile_active]
+    jne .tls_invalid
+    test al, al
+    jz .tls_load_key
+
+    call load_keyfile_hash
+    lea rdi, [rel session_buf + SESSION_KEYFILE_HASH_OFFSET]
+    lea rsi, [rel keyfile_hash]
+    mov ecx, KEY_LEN
+    call memcmp
+    test eax, eax
+    jnz .tls_invalid
+
+.tls_load_key:
+    lea rsi, [rel session_buf + SESSION_KEY_OFFSET]
+    lea rdi, [rel derived_key]
+    mov ecx, KEY_LEN
+    rep movsb
+
+    mov byte [rel session_active], 1
+    lea rdi, [rel session_buf]
+    mov ecx, 128
+    call zero_mem
+    mov eax, 1
+    jmp .tls_done
+
+.tls_invalid:
     lea rdi, [rel session_path]
     call file_exists
     test eax, eax
-    jz .tls_no
-
-    ; Read session file
-    lea rdi, [rel session_path]
-    lea rsi, [rel session_buf]
-    mov edx, 48
-    call read_file
-    cmp eax, 48
-    jne .tls_no
-
-    ; Decrypt: key = stored_key XOR SHA-256(nonce)
+    jz .tls_no_file
+    call wipe_session_file
+.tls_no_file:
     lea rdi, [rel session_buf]
-    mov esi, 16
-    lea rdx, [rel hidden_salt]  ; reuse as temp
-    call sha256_hash
-
-    ; Copy encrypted key and XOR with hash
-    lea rsi, [rel session_buf]
-    add rsi, 16
-    lea rdi, [rel derived_key]
-    mov ecx, 32
-    rep movsb
-    lea rdi, [rel derived_key]
-    lea rsi, [rel hidden_salt]
-    mov ecx, 32
-.tls_xor:
-    mov al, [rsi]
-    xor [rdi], al
-    inc rdi
-    inc rsi
-    dec ecx
-    jnz .tls_xor
-
-    ; Zero session_buf
-    lea rdi, [rel session_buf]
-    mov ecx, 64
+    mov ecx, 128
     call zero_mem
-
-    mov eax, 1
-    pop rbx
-    ret
-
-.tls_no:
     xor eax, eax
-    pop rbx
+
+.tls_done:
+    pop rdi
+    pop rsi
+    pop rcx
     ret
 
 ; open_hidden_vault — prompt for hidden password, find hidden section
@@ -6028,19 +6949,7 @@ apply_keyfile:
     push rbx
     push rcx
 
-    ; Read keyfile
-    mov rdi, [rel keyfile_path]
-    lea rsi, [rel keyfile_buf]
-    mov edx, 256
-    call read_file
-    test eax, eax
-    jz .akf_done            ; skip if file empty/missing
-
-    ; Hash keyfile contents: SHA-256(keyfile_data)
-    lea rdi, [rel keyfile_buf]
-    mov esi, eax
-    lea rdx, [rel keyfile_hash]
-    call sha256_hash
+    call load_keyfile_hash
 
     ; XOR derived_key with keyfile_hash
     lea rdi, [rel derived_key]
@@ -6055,13 +6964,32 @@ apply_keyfile:
     jnz .akf_xor
 
 .akf_done:
-    ; Zero keyfile buffer
+    pop rcx
+    pop rbx
+    ret
+
+; load_keyfile_hash — read keyfile and hash it into keyfile_hash
+load_keyfile_hash:
+    mov rdi, [rel keyfile_path]
+    lea rsi, [rel keyfile_buf]
+    mov edx, 256
+    call read_file
+    test eax, eax
+    jnz .lkh_loaded
+    lea rdi, [rel msg_keyfile_required]
+    call print_str
+    mov edi, 1
+    call exit
+
+.lkh_loaded:
+    lea rdi, [rel keyfile_buf]
+    mov esi, eax
+    lea rdx, [rel keyfile_hash]
+    call sha256_hash
+
     lea rdi, [rel keyfile_buf]
     mov ecx, 256
     call zero_mem
-
-    pop rcx
-    pop rbx
     ret
 
 ; mlock_sensitive — pin sensitive buffers in RAM to prevent swap
@@ -6317,11 +7245,17 @@ open_vault:
     test eax, eax
     jnz .ov_session_loaded
 
-    ; No session — read master password
+    ; No session — check VAULT_PASS env var first
+    call try_env_pass
+    test eax, eax
+    jnz .ov_have_pass
+
+    ; No env var — prompt interactively
     lea rdi, [rel prompt_master]
     lea rsi, [rel master_pw]
     mov edx, 255
     call read_password
+.ov_have_pass:
     ; Get pw length
     lea rdi, [rel master_pw]
     call strlen
@@ -6346,7 +7280,11 @@ open_vault:
     mov rsi, r12
     lea rdx, [rel vault_salt]
     mov ecx, SALT_LEN
-    mov r8, PBKDF2_ITER
+    mov r8d, dword [rel vault_buf + 26]
+    test r8d, r8d
+    jnz .ov_pbkdf2_iters_loaded
+    mov r8d, PBKDF2_ITER
+.ov_pbkdf2_iters_loaded:
     lea r9, [rel derived_key]
     call pbkdf2_sha256
     jmp .ov_kdf_done
@@ -7567,6 +8505,177 @@ print_char:
     pop rax
     ret
 
+; print_json_quoted — print a null-terminated string as a JSON string literal
+;   rdi = string
+print_json_quoted:
+    push rbx
+    mov rbx, rdi
+    mov al, '"'
+    call print_char
+.pjq_loop:
+    mov al, [rbx]
+    test al, al
+    jz .pjq_done
+    cmp al, '"'
+    je .pjq_quote
+    cmp al, 92
+    je .pjq_bs
+    cmp al, 10
+    je .pjq_n
+    cmp al, 13
+    je .pjq_r
+    cmp al, 9
+    je .pjq_t
+    call print_char
+    inc rbx
+    jmp .pjq_loop
+.pjq_quote:
+    lea rdi, [rel json_escape_quote]
+    call print_str
+    inc rbx
+    jmp .pjq_loop
+.pjq_bs:
+    lea rdi, [rel json_escape_bs]
+    call print_str
+    inc rbx
+    jmp .pjq_loop
+.pjq_n:
+    lea rdi, [rel json_escape_n]
+    call print_str
+    inc rbx
+    jmp .pjq_loop
+.pjq_r:
+    lea rdi, [rel json_escape_r]
+    call print_str
+    inc rbx
+    jmp .pjq_loop
+.pjq_t:
+    lea rdi, [rel json_escape_t]
+    call print_str
+    inc rbx
+    jmp .pjq_loop
+.pjq_done:
+    mov al, '"'
+    call print_char
+    pop rbx
+    ret
+
+; print_json_quoted_n — print a length-delimited buffer as a JSON string literal
+;   rdi = buffer, eax = length
+print_json_quoted_n:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12d, eax
+    mov al, '"'
+    call print_char
+.pjqn_loop:
+    test r12d, r12d
+    jz .pjqn_done
+    mov al, [rbx]
+    cmp al, '"'
+    je .pjqn_quote
+    cmp al, 92
+    je .pjqn_bs
+    cmp al, 10
+    je .pjqn_n
+    cmp al, 13
+    je .pjqn_r
+    cmp al, 9
+    je .pjqn_t
+    call print_char
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_quote:
+    lea rdi, [rel json_escape_quote]
+    call print_str
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_bs:
+    lea rdi, [rel json_escape_bs]
+    call print_str
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_n:
+    lea rdi, [rel json_escape_n]
+    call print_str
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_r:
+    lea rdi, [rel json_escape_r]
+    call print_str
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_t:
+    lea rdi, [rel json_escape_t]
+    call print_str
+    inc rbx
+    dec r12d
+    jmp .pjqn_loop
+.pjqn_done:
+    mov al, '"'
+    call print_char
+    pop r12
+    pop rbx
+    ret
+
+; parse_output_flags — parse trailing --raw / --json flags
+;   rdi = starting argv index
+parse_output_flags:
+    push r12
+    mov r12, rdi
+    mov byte [rel output_raw], 0
+    mov byte [rel output_json], 0
+.pof_loop:
+    mov rax, [rel argc]
+    cmp r12, rax
+    jge .pof_done
+    mov rax, [rel argv]
+    mov rdi, [rax + r12*8]
+    lea rsi, [rel raw_flag]
+    push r12
+    call strcmp
+    pop r12
+    test eax, eax
+    jnz .pof_check_json
+    cmp byte [rel output_json], 0
+    jne .pof_conflict
+    mov byte [rel output_raw], 1
+    inc r12
+    jmp .pof_loop
+.pof_check_json:
+    mov rax, [rel argv]
+    mov rdi, [rax + r12*8]
+    lea rsi, [rel json_flag]
+    push r12
+    call strcmp
+    pop r12
+    test eax, eax
+    jnz .pof_bad
+    cmp byte [rel output_raw], 0
+    jne .pof_conflict
+    mov byte [rel output_json], 1
+    inc r12
+    jmp .pof_loop
+.pof_bad:
+    lea rdi, [rel msg_output_opt]
+    call print_str
+    mov edi, 1
+    call exit
+.pof_conflict:
+    lea rdi, [rel msg_output_conflict]
+    call print_str
+    mov edi, 1
+    call exit
+.pof_done:
+    pop r12
+    ret
+
 ; print_hex — print N bytes as hex string
 ;   rdi = data, esi = byte count
 print_hex:
@@ -7851,6 +8960,7 @@ file_exists:
 read_file:
     push r12
     push r13
+    push r14
     mov r12, rsi            ; buffer
     mov r13d, edx           ; max size
 
@@ -7861,24 +8971,39 @@ read_file:
     js .rf_err
 
     mov edi, eax            ; fd
-    push rdi
+    mov r14, 0              ; total bytes read
+.rf_read_loop:
+    cmp r14d, r13d
+    jge .rf_done_reading
     mov rsi, r12
+    add rsi, r14
     mov edx, r13d
+    sub edx, r14d
     mov eax, SYS_READ
     syscall
-    push rax                ; bytes read
-    pop rax
-    pop rdi
-    push rax
+    test eax, eax
+    js .rf_close_err
+    jz .rf_done_reading
+    add r14, rax
+    jmp .rf_read_loop
+
+.rf_done_reading:
     mov eax, SYS_CLOSE
     syscall
-    pop rax
+    mov rax, r14
 
+    pop r14
     pop r13
     pop r12
     ret
+.rf_close_err:
+    push rdi
+    mov eax, SYS_CLOSE
+    syscall
+    pop rdi
 .rf_err:
     xor eax, eax
+    pop r14
     pop r13
     pop r12
     ret
@@ -7889,6 +9014,7 @@ write_file:
     push r12
     push r13
     push r14
+    push r15
     mov r12, rsi            ; data
     mov r13d, edx           ; length
     mov r14d, ecx           ; mode
@@ -7901,16 +9027,30 @@ write_file:
     js .wf_err
 
     mov edi, eax            ; fd
-    push rdi
+    mov r15, 0              ; total bytes written
+.wf_write_loop:
+    cmp r15d, r13d
+    jge .wf_close
     mov rsi, r12
+    add rsi, r15
     mov edx, r13d
+    sub edx, r15d
     mov eax, SYS_WRITE
     syscall
-    pop rdi
+    test eax, eax
+    js .wf_close
+    test eax, eax
+    jz .wf_close
+    add r15, rax
+    jmp .wf_write_loop
+
+.wf_close:
     mov eax, SYS_CLOSE
     syscall
+    mov rax, r15
 
 .wf_err:
+    pop r15
     pop r14
     pop r13
     pop r12

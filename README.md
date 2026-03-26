@@ -19,13 +19,17 @@ Requires: `nasm`, `ld` (GNU binutils), Linux x86-64.
 
 ```bash
 # Create your vault
-vault init
+printf 'master-pass\n' | vault init --password-stdin
 
 # Add an entry
-vault add github
+printf 'master-pass\nentry-pass\n' | vault add github --username alice --password-stdin --url https://github.com
 
 # Get a password
 vault get github password
+
+# Machine-readable retrieval
+vault get github password --raw
+vault get github --json
 
 # Copy password to clipboard (auto-clears in 30s)
 vault clip github
@@ -38,14 +42,16 @@ vault list
 
 # Get a TOTP 2FA code
 vault totp github
+vault totp github --raw
+vault totp github --json
 ```
 
 ## All Commands
 
 | Command | Description |
 |---------|-------------|
-| `vault init` | Create vault with master password |
-| `vault add <name>` | Add entry (prompts for username, password, URL, notes, TOTP) |
+| `vault init [--password-stdin]` | Create vault with master password |
+| `vault add <name> [flags]` | Add entry interactively or via field flags |
 | `vault get <name> [field]` | Get entry (field: username, password, url, notes, totp) |
 | `vault show <name>` | Pretty-print entry with password strength |
 | `vault list` | List all entry names |
@@ -62,11 +68,12 @@ vault totp github
 | `vault clip <name> [field]` | Copy field to clipboard, auto-clear 30s |
 | `vault verify` | Verify vault integrity (HMAC check) |
 | `vault backup` | Create timestamped backup |
-| `vault unlock` | Cache key for 5 minutes (no repeated password prompts) |
+| `vault unlock` | Cache the derived key for 5 minutes in a mode-0600 session file |
 | `vault lock` | Clear cached session |
 | `vault wipe` | Securely destroy vault (3-pass overwrite) |
 | `vault hidden <cmd>` | Plausible deniability (hidden vault within vault) |
 | `vault migrate` | Migrate old entries to new format |
+| `vault help` | Show command usage |
 
 ## Flags
 
@@ -74,7 +81,15 @@ vault totp github
 |------|-------------|
 | `--keyfile <path>` | Two-factor: master password + key file |
 | `--vault <name>` | Use named vault (`~/.vault-<name>/`) |
+| `--vault-path <path>` | Use an explicit vault file path |
 | `--argon2` | Use Argon2id KDF instead of PBKDF2 (for `init`) |
+| `--password-stdin` | Read the init password or add-entry password from stdin |
+| `--username <value>` | Set username for `add` without prompting |
+| `--url <value>` | Set URL for `add` without prompting |
+| `--notes <value>` | Set notes for `add` without prompting |
+| `--totp <value>` | Set TOTP seed for `add` without prompting |
+| `--raw` | Print command output in a minimal agent/script-friendly form |
+| `--json` | Print command output as JSON for supported read commands |
 
 ## Cryptography
 
@@ -121,6 +136,14 @@ SHA-256 validated against NIST test vectors. TOTP verified against `oathtool`.
 - **Argon2id** — memory-hard KDF resists GPU/ASIC brute force
 - **Secure wipe** — 3-pass overwrite (zeros, 0xFF, random) + unlink
 - **Plausible deniability** — hidden vault with separate password, indistinguishable from random data
+
+## Notes
+
+- `vault unlock` caches the derived key for 5 minutes in a mode-0600 per-user session file and binds it to the current vault plus keyfile state.
+- `--vault-path` is the safest way to test or script against a non-default vault file without touching `~/.vault/vault.enc`.
+- `vault add` still prompts for the master password first; with `--password-stdin`, the next stdin line is used as the entry password.
+- `--raw` currently covers the core read path broadly, and `--json` is supported for `get`, `list`, `search`, `count`, and `verify`.
+- `vault totp <name> --raw` returns the live 6-digit code only, and `--json` returns `{"code":"123456"}`.
 
 ## Switching from Bitwarden
 
