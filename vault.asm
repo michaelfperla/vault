@@ -15,6 +15,16 @@ BITS 64
 %define SYS_MMAP        9
 %define SYS_IOCTL       16
 %define SYS_EXIT        60
+%define SYS_PRCTL       157
+%define PR_SET_DUMPABLE 4
+
+; Linux kernel keyring — replaces plaintext-key-on-disk session cache.
+%define SYS_ADD_KEY     248
+%define SYS_KEYCTL      250
+%define KEYCTL_READ            11
+%define KEYCTL_SET_TIMEOUT     15
+%define KEYCTL_INVALIDATE      21
+%define KEY_SPEC_SESSION_KEYRING 0xFFFFFFFD   ; -3 as unsigned u32 → kernel sign-extends
 %define SYS_UNLINK      87
 %define SYS_RENAME      82
 %define SYS_MKDIR       83
@@ -35,15 +45,18 @@ BITS 64
 %define SYS_SETSID     112
 %define SYS_FSTAT      5
 
-%define SESSION_TIMEOUT 300     ; 5 minutes default
+%define SESSION_TIMEOUT 60      ; 1 minute keyring expiry
 %define SESSION_EXPIRY_OFFSET       0
 %define SESSION_VAULT_HMAC_OFFSET   8
 %define SESSION_KEYFILE_FLAG_OFFSET 40
 %define SESSION_KEYFILE_HASH_OFFSET 41
-%define SESSION_KEY_OFFSET          73
-%define SESSION_FILE_SIZE          105
-; Session file stores:
-;   expiry(8) + vault_hmac(32) + keyfile_flag(1) + keyfile_hash(32) + derived_key(32)
+%define SESSION_SERIAL_OFFSET       73
+%define SESSION_FILE_SIZE           77      ; v2 stub — was 105 with key bytes
+; Session file v2 stores:
+;   expiry(8) + vault_hmac(32) + keyfile_flag(1) + keyfile_hash(32) + keyring_serial(4)
+; The derived_key itself lives in the Linux kernel session keyring under
+; description "vault:session"; the stub only holds the serial number that
+; lets us fetch it back. File-disclosure attacks no longer leak the key.
 
 ; ── File flags ───────────────────────────────────────────────
 %define O_RDONLY    0
@@ -190,9 +203,11 @@ cmd_lock:       db "lock", 0
 cmd_hidden:     db "hidden", 0
 cmd_migrate:    db "migrate", 0
 cmd_help:       db "help", 0
+cmd_status:     db "status", 0
 msg_migrate_ok: db "Vault migrated to new format (with TOTP field).", 10, 0
 msg_migrating:  db "Migrating entry: ", 0
 cmd_test_sha:   db "test-sha256", 0
+cmd_test_cc:    db "test-chacha20", 0
 
 ; ── Field prompts ────────────────────────────────────────────
 prompt_master:      db "Master password: ", 0
@@ -262,6 +277,40 @@ msg_not_found:  db "Error: entry not found.", 10
 msg_exists:     db "Error: entry already exists.", 10, 0
 msg_no_name:    db "Error: name required.", 10, 0
 msg_init_opt:   db "Error: unsupported init option. Try 'vault help init'.", 10, 0
+msg_unknown_cmd: db "Error: unknown command. Run 'vault' with no arguments for usage.", 10, 0
+
+; ── status command strings ───────────────────────────────────
+status_label_path:    db "path:            ", 0
+status_label_exists:  db "exists:          ", 0
+status_label_version: db "version:         ", 0
+status_label_kdf:     db "kdf:             ", 0
+status_label_entries: db "entries:         ", 0
+status_label_session: db "session_active:  ", 0
+status_yes:           db "yes", 10, 0
+status_no:            db "no", 10, 0
+status_kdf_pbkdf2:    db "pbkdf2-sha256", 10, 0
+status_kdf_argon2:    db "argon2id", 10, 0
+status_kdf_unknown:   db "unknown", 10, 0
+status_v1:            db "1 (PBKDF2, legacy)", 10, 0
+status_v2:            db "2 (Argon2id, legacy header)", 10, 0
+status_v3:            db "3 (Argon2id + authenticated header)", 10, 0
+status_v0:            db "0", 10, 0
+
+; JSON keys for status
+json_status_path:     db '"path":"', 0
+json_status_exists:   db '","exists":', 0
+json_status_version:  db ',"version":', 0
+json_status_kdf:      db ',"kdf":"', 0
+json_status_entries:  db '","entries":', 0
+json_status_session:  db ',"session_active":', 0
+json_true_close:      db "true}", 10, 0
+json_false_close:     db "false}", 10, 0
+json_obj_close:       db "}", 10, 0
+json_true_word:       db "true", 0
+json_false_word:      db "false", 0
+json_kdf_pbkdf2_word: db 'pbkdf2-sha256', 0
+json_kdf_argon2_word: db 'argon2id', 0
+json_kdf_unknown_word: db 'unknown', 0
 msg_add_opt:    db "Error: unsupported add option. Try 'vault help add'.", 10, 0
 msg_opt_value:  db "Error: option requires a value.", 10, 0
 msg_imported:   db " entries imported.", 10, 0
@@ -292,7 +341,20 @@ msg_wipe_abort: db "Wipe aborted.", 10, 0
 msg_mlock_ok:   db 0    ; silent
 wipe_confirm:   db "DESTROY", 0
 keyfile_flag:   db "--keyfile", 0
-argon2_flag:    db "--argon2", 0
+argon2_flag:    db "--argon2", 0          ; preserved for backward compat (no-op since v3 default)
+pbkdf2_flag:    db "--pbkdf2", 0          ; opt back into legacy v1 PBKDF2 KDF
+upgrade_kdf_flag: db "--upgrade-kdf", 0   ; vault migrate --upgrade-kdf
+v4_flag_str:    db "--v4", 0              ; opt into v4 (ChaCha20-Poly1305 AEAD) on init
+upgrade_aead_flag: db "--upgrade-aead", 0 ; vault migrate --upgrade-aead (v3 → v4)
+msg_migrate_already_v3: db "Vault is already at version 3. Nothing to upgrade.", 10, 0
+msg_migrate_upgrade_ok: db "Vault upgraded to v3 (Argon2id + authenticated header).", 10, 0
+msg_migrate_upgrade_aead_ok: db "Vault upgraded to v4 (ChaCha20-Poly1305 AEAD).", 10, 0
+msg_already_v4: db "Vault is already v4.", 10, 0
+msg_hidden_v4_unsupported: db "Error: vault contains a hidden section; v4 migration with hidden sections is not yet supported.", 10, 0
+msg_hidden_v4_blocked: db "Error: hidden vault operations are not supported on v4 vaults.", 10, 0
+err_no_random: db "FATAL: kernel random source returned short or failed; aborting to avoid weak crypto.", 10
+ERR_NO_RANDOM_LEN equ $ - err_no_random
+msg_migrate_too_big:    db "Error: vault too large to upgrade in-place (>64 KiB entries).", 10, 0
 password_stdin_flag: db "--password-stdin", 0
 username_flag:  db "--username", 0
 url_flag:       db "--url", 0
@@ -300,10 +362,20 @@ notes_flag:     db "--notes", 0
 totp_flag:      db "--totp", 0
 raw_flag:       db "--raw", 0
 json_flag:      db "--json", 0
+exact_flag:     db "--exact", 0
 msg_argon2_init: db "Vault created with Argon2id (16 MiB, 3 iterations).", 10, 0
 msg_argon2_kdf:  db 0   ; silent marker
 
-%define VAULT_VERSION_ARGON2 0x0002
+%define VAULT_VERSION_PBKDF2 0x0001     ; legacy: PBKDF2 + HMAC over [62..end]
+%define VAULT_VERSION_ARGON2 0x0002     ; legacy: Argon2id + HMAC over [62..end]
+%define VAULT_VERSION_V3     0x0003     ; Argon2id + HMAC over full file (slot zeroed)
+%define VAULT_VERSION_V4     0x0004     ; Argon2id + ChaCha20-Poly1305 AEAD (header=AAD)
+%define V4_HEADER_LEN        62         ; header bytes used as AAD (magic+ver+salt+iter+nonce+reserved)
+%define V4_TAG_LEN           16         ; Poly1305 tag length
+%define V4_NONCE_LEN         12         ; ChaCha20 nonce length
+%define V4_NONCE_OFFSET      30         ; offset of nonce within header
+%define V4_RESERVED_OFFSET   42         ; offset of zero-reserved bytes
+%define V4_RESERVED_LEN      20         ; size of zero-reserved region
 vault_flag:     db "--vault", 0
 vault_path_flag: db "--vault-path", 0
 vault_dir_fmt:  db "/.vault-", 0     ; HOME + /.vault-<name>/vault.enc
@@ -323,6 +395,13 @@ msg_keyfile_required: db "Error: key file missing, unreadable, or empty.", 10
                       db "Next: verify the --keyfile path and file contents, then retry.", 10, 0
 session_path_prefix: db "/tmp/.vault-session-", 0
 
+; Linux keyring strings
+key_type_user:  db "user", 0
+key_desc_prefix: db "vault:session:", 0    ; followed by 16 hex chars of vault_hmac
+err_msg_keyring: db "kernel keyring unavailable", 0
+err_code_keyring: db "keyring_unavailable", 0
+msg_keyring_unavailable: db "Error: kernel keyring unavailable. Run from a logged-in session, or operate without `unlock` caching.", 10, 0
+
 ; ── Hidden vault messages ────────────────────────────────────
 msg_hidden_init:    db "Hidden vault initialized within main vault.", 10, 0
 msg_hidden_pw:      db "Hidden password: ", 0
@@ -336,6 +415,52 @@ json_empty_arr: db "[]", 10, 0
 json_key_count: db "count", 0
 json_key_code:  db "code", 0
 msg_ok_raw:     db "ok", 10, 0
+
+; ── JSON error envelope fragments ────────────────────────────
+json_err_prefix:   db '{"ok":false,"code":"', 0
+json_err_middle:   db '","error":"', 0
+json_err_suffix:   db '"}', 10, 0
+
+; ── Error code slugs (machine-stable) ────────────────────────
+err_code_no_vault:      db "no_vault", 0
+err_code_need_name:     db "need_name", 0
+err_code_not_found:     db "not_found", 0
+err_code_entry_exists:  db "entry_exists", 0
+err_code_bad_output:    db "bad_output_flag", 0
+err_code_output_conflict: db "output_flag_conflict", 0
+err_code_unknown_cmd:   db "unknown_command", 0
+err_code_auth_failed:   db "auth_failed", 0
+err_code_pw_mismatch:   db "password_mismatch", 0
+err_code_vault_exists:  db "vault_exists", 0
+err_code_missing_value: db "missing_value", 0
+err_code_no_xclip:      db "no_xclip", 0
+err_code_no_totp:       db "no_totp", 0
+err_code_session_write: db "session_write_fail", 0
+err_code_keyfile:       db "keyfile_required", 0
+err_code_bad_option:    db "bad_option", 0
+err_code_list_empty:    db "vault_empty", 0
+err_code_no_session:    db "no_session", 0
+
+; Short error messages used inside the JSON envelope (no trailing newline, no hint text)
+err_msg_no_vault:      db "no vault found at the selected path", 0
+err_msg_need_name:     db "name required", 0
+err_msg_not_found:     db "entry not found", 0
+err_msg_entry_exists:  db "entry already exists", 0
+err_msg_bad_output:    db "unsupported output option", 0
+err_msg_output_conflict: db "conflicting output modes (--raw and --json)", 0
+err_msg_unknown_cmd:   db "unknown command", 0
+err_msg_auth_failed:   db "vault could not be opened (wrong password, key file, or corrupted data)", 0
+err_msg_pw_mismatch:   db "passwords do not match", 0
+err_msg_vault_exists:  db "vault already exists at the selected path", 0
+err_msg_missing_value: db "option requires a value", 0
+err_msg_no_xclip:      db "xclip not found", 0
+err_msg_no_totp:       db "no TOTP secret stored for this entry", 0
+err_msg_session_write: db "could not write session cache", 0
+err_msg_keyfile:       db "key file missing, unreadable, or empty", 0
+err_msg_list_empty:    db "vault is empty", 0
+err_msg_no_session:    db "no active session", 0
+err_msg_bad_option:    db "unsupported option", 0
+
 json_escape_quote: db 92, 34, 0
 json_escape_bs:    db 92, 92, 0
 json_escape_n:     db 92, 'n', 0
@@ -389,6 +514,72 @@ expected_hello:
     db 0x26, 0xe8, 0x3b, 0x2a, 0xc5, 0xb9, 0xe2, 0x9e
     db 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e
     db 0x73, 0x04, 0x33, 0x62, 0x93, 0x8b, 0x98, 0x24
+
+; ── ChaCha20 test data (RFC 8439 §2.3.2) ─────────────────────
+test_cc_hdr:    db "=== ChaCha20 Test Vectors (RFC 8439) ===", 10, 0
+test_cc_232:    db "Block §2.3.2:    ", 0
+
+; RFC 8439 §2.3.2 inputs:
+; key   = 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+;         10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
+; nonce = 00 00 00 09 00 00 00 4a 00 00 00 00
+; ctr   = 1
+cc_232_key:
+    db 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07
+    db 0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+    db 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17
+    db 0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
+cc_232_nonce:
+    db 0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x4a
+    db 0x00,0x00,0x00,0x00
+
+; Expected serialized block (RFC 8439 §2.3.2):
+cc_232_expected:
+    db 0x10,0xf1,0xe7,0xe4,0xd1,0x3b,0x59,0x15
+    db 0x50,0x0f,0xdd,0x1f,0xa3,0x20,0x71,0xc4
+    db 0xc7,0xd1,0xf4,0xc7,0x33,0xc0,0x68,0x03
+    db 0x04,0x22,0xaa,0x9a,0xc3,0xd4,0x6c,0x4e
+    db 0xd2,0x82,0x64,0x46,0x07,0x9f,0xaa,0x09
+    db 0x14,0xc2,0xd7,0x05,0xd9,0x8b,0x02,0xa2
+    db 0xb5,0x12,0x9c,0xd1,0xde,0x16,0x4e,0xb9
+    db 0xcb,0xd0,0x83,0xe8,0xa2,0x50,0x3c,0x4e
+
+; ── Poly1305 test data (RFC 8439 §2.5.2) ─────────────────────
+test_p_252:     db "Poly1305 §2.5.2: ", 0
+p_252_key:
+    db 0x85,0xd6,0xbe,0x78,0x57,0x55,0x6d,0x33
+    db 0x7f,0x44,0x52,0xfe,0x42,0xd5,0x06,0xa8
+    db 0x01,0x03,0x80,0x8a,0xfb,0x0d,0xb2,0xfd
+    db 0x4a,0xbf,0xf6,0xaf,0x41,0x49,0xf5,0x1b
+p_252_msg:
+    db "Cryptographic Forum Research Group"
+P_252_MSG_LEN equ $ - p_252_msg
+p_252_expected:
+    db 0xa8,0x06,0x1d,0xc1,0x30,0x51,0x36,0xc6
+    db 0xc2,0x2b,0x8b,0xaf,0x0c,0x01,0x27,0xa9
+
+; ── AEAD test data (RFC 8439 §2.8.2) ─────────────────────────
+test_a_282:     db "AEAD §2.8.2 tag: ", 0
+test_a_rt:      db "AEAD roundtrip:  ", 0
+test_a_tp:      db "AEAD tamper rej: ", 0
+a_282_key:
+    db 0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87
+    db 0x88,0x89,0x8a,0x8b,0x8c,0x8d,0x8e,0x8f
+    db 0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97
+    db 0x98,0x99,0x9a,0x9b,0x9c,0x9d,0x9e,0x9f
+a_282_nonce:
+    db 0x07,0x00,0x00,0x00,0x40,0x41,0x42,0x43
+    db 0x44,0x45,0x46,0x47
+a_282_aad:
+    db 0x50,0x51,0x52,0x53,0xc0,0xc1,0xc2,0xc3
+    db 0xc4,0xc5,0xc6,0xc7
+A_282_AAD_LEN equ $ - a_282_aad
+a_282_pt:
+    db "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+A_282_PT_LEN equ $ - a_282_pt
+a_282_tag:
+    db 0x1a,0xe1,0x0b,0x59,0x4f,0x09,0xe2,0x6a
+    db 0x7e,0x90,0x2e,0xcb,0xd0,0x60,0x06,0x91
 
 test_sha1_abc_msg: db "SHA1('abc'):  ", 0
 expected_sha1_abc:
@@ -464,8 +655,9 @@ config_gen_len: resd 1          ; configured default password length
 vault_name:     resb 64         ; --vault name (for multi-vault)
 
 ; ── Session management ───────────────────────────────────────
-session_path:   resb 128        ; /tmp/.vault-session-<uid>
+session_path:   resb 128        ; /tmp/.vault-session-<uid>-<hex>
 session_buf:    resb 128        ; session file buffer
+old_session_path: resb 128      ; pre-save snapshot of session path (for cleanup after save changes the HMAC slot)
 session_active: resb 1          ; 1 if session key loaded from file
 
 ; ── Hidden vault ─────────────────────────────────────────────
@@ -515,6 +707,8 @@ master_pw2:     resb 256
 init_pw_from_stdin: resb 1
 output_raw:     resb 1
 output_json:    resb 1
+status_numbuf:  resb 32          ; scratch for itoa in do_status
+saved_hmac_slot: resb 32         ; scratch for v3 HMAC verify (preserve-zero-restore)
 entry_name:     resb MAX_NAME_LEN
 entry_user:     resb MAX_FIELD_LEN
 entry_pass:     resb MAX_FIELD_LEN
@@ -528,6 +722,14 @@ add_totp_provided: resb 1
 add_pw_from_stdin: resb 1
 entry_data:     resb MAX_ENTRY_DATA
 crypt_buf:      resb MAX_ENTRY_DATA
+migrate_old_entries:    resb 65536      ; saved ciphertext section during KDF upgrade
+migrate_old_entries_size: resq 1
+migrate_old_entry_count: resd 1
+migrate_old_key:        resb 32         ; key derived with old KDF
+migrate_new_key:        resb 32         ; key derived with new KDF
+migrate_cursor:         resq 1          ; walking pointer through migrate_old_entries
+migrate_remaining:      resd 1          ; entries left to re-encrypt
+keyring_desc:           resb 64         ; "vault:session:<16 hex>" + null
 hex_out:        resb 128
 edit_buf:       resb MAX_FIELD_LEN
 search_term:    resb MAX_NAME_LEN
@@ -553,6 +755,23 @@ iv_buf:         resb IV_LEN
 keystream_blk:  resb 32
 ctr_input:      resb 32         ; IV(16) + counter(4) for CTR mode
 
+; ── ChaCha20 working space (RFC 8439) ────────────────────────
+chacha_state:   resd 16         ; initial state: const(4) || key(8) || ctr(1) || nonce(3)
+chacha_work:    resd 16         ; working state, mutated by 20 rounds
+chacha_block:   resb 64         ; serialized keystream block output
+
+; ── Poly1305 working space (RFC 8439 §2.5) ───────────────────
+poly_r:         resq 2          ; clamped 128-bit r (LE)
+poly_s:         resq 2          ; pad value s (LE)
+poly_h:         resq 3          ; accumulator h0, h1, h2 (radix 2^64, h2 small)
+poly_buf:       resb 16         ; partial-block padding buffer
+poly_tag:       resb 16         ; tag output scratch
+poly_otk:       resb 32         ; one-time Poly1305 key (AEAD)
+poly_lens:      resb 16         ; AEAD length block (aad_len || ct_len, LE u64)
+aead_scratch:   resb 128        ; AEAD test scratch (plaintext copy)
+g_vault_version: resw 1         ; set by open_vault / init: 1/2/3/4
+v4_flag:        resb 1          ; CLI flag: 1 = --v4 requested on init
+
 ; ════════════════════════════════════════════════════════════════
 section .text
 global _start
@@ -565,6 +784,17 @@ _start:
     lea rax, [rsp+8]        ; argv[0]
     mov [rel argv], rax
 
+    ; Disable coredumps and ptrace-attach: prctl(PR_SET_DUMPABLE, 0, 0, 0, 0).
+    ; Defeats `gcore`, core-dump-on-crash key exfil, and same-uid ptrace inspection
+    ; of master_pw / derived_key while they're live in memory.
+    mov edi, PR_SET_DUMPABLE
+    xor esi, esi
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    mov eax, SYS_PRCTL
+    syscall
+
     ; Build vault path from HOME env
     call build_vault_path
 
@@ -573,21 +803,39 @@ _start:
     cmp rax, 2
     jl show_usage
 
-    ; Check for --argon2 flag (no-arg flag, just shifts by 1)
-    mov byte [rel argon2_use_argon2], 0
+    ; KDF selection: Argon2id is the default since hardening leap.
+    ; --pbkdf2 opts back into the legacy KDF. --argon2 is kept as a no-op
+    ; alias so older scripts don't break.
+    mov byte [rel argon2_use_argon2], 1
     mov rax, [rel argv]
     mov rdi, [rax+8]
     lea rsi, [rel argon2_flag]
     call strcmp
     test eax, eax
-    jnz .no_argon2_flag
-    mov byte [rel argon2_use_argon2], 1
+    jnz .check_pbkdf2_flag
+    ; explicit --argon2: still default, just shift it off argv
     mov rax, [rel argc]
     dec rax
     mov [rel argc], rax
     mov rax, [rel argv]
     add rax, 8
     mov [rel argv], rax
+    jmp .no_kdf_flag
+.check_pbkdf2_flag:
+    mov rax, [rel argv]
+    mov rdi, [rax+8]
+    lea rsi, [rel pbkdf2_flag]
+    call strcmp
+    test eax, eax
+    jnz .no_kdf_flag
+    mov byte [rel argon2_use_argon2], 0
+    mov rax, [rel argc]
+    dec rax
+    mov [rel argc], rax
+    mov rax, [rel argv]
+    add rax, 8
+    mov [rel argv], rax
+.no_kdf_flag:
 .no_argon2_flag:
 
     ; Check for --keyfile flag: vault --keyfile <path> <command> [args]
@@ -679,6 +927,24 @@ _start:
     mov [rel argv], rax
 .no_vault_path_flag:
 
+    ; --v4 flag (must come after --vault-path/--keyfile so it sees the
+    ; right argv[1] regardless of which flags preceded the command).
+    mov byte [rel v4_flag], 0
+    mov rax, [rel argv]
+    mov rdi, [rax+8]
+    lea rsi, [rel v4_flag_str]
+    call strcmp
+    test eax, eax
+    jnz .no_v4_flag2
+    mov byte [rel v4_flag], 1
+    mov rax, [rel argc]
+    dec rax
+    mov [rel argc], rax
+    mov rax, [rel argv]
+    add rax, 8
+    mov [rel argv], rax
+.no_v4_flag2:
+
     ; Load config file (sets config_gen_len)
     call load_config
 
@@ -691,6 +957,13 @@ _start:
     call strcmp
     test eax, eax
     jz cmd_test_sha256
+
+    mov rax, [rel argv]
+    mov rdi, [rax+8]
+    lea rsi, [rel cmd_test_cc]
+    call strcmp
+    test eax, eax
+    jz cmd_test_chacha20
 
     lea rsi, [rel cmd_init]
     mov rdi, [rel argv]
@@ -845,6 +1118,22 @@ _start:
     call strcmp
     test eax, eax
     jz do_help
+
+    lea rsi, [rel cmd_status]
+    mov rdi, [rel argv]
+    mov rdi, [rdi+8]
+    call strcmp
+    test eax, eax
+    jz do_status
+
+    ; Fall-through: argv[1] is not a recognized command.
+    ; Distinct from the no-args case (which jumps to show_usage directly).
+err_unknown_command:
+    lea rdi, [rel err_msg_unknown_cmd]
+    lea rsi, [rel err_code_unknown_cmd]
+    lea rdx, [rel msg_unknown_cmd]
+    mov ecx, 2
+    call emit_err
 
 show_usage:
     lea rdi, [rel msg_usage]
@@ -1010,7 +1299,9 @@ try_env_pass:
     jne .tep_next
     cmp byte [rdi+10], '='
     jne .tep_next
-    ; Found — copy value after '=' to master_pw
+    ; Found — copy value after '=' to master_pw, then SCRUB the env value
+    ; in-place so /proc/<pid>/environ no longer reveals the password.
+    ; envp memory is writable (kernel sets up envp on the initial stack).
     lea rsi, [rdi+11]
     lea rdi, [rel master_pw]
     xor ecx, ecx
@@ -1018,11 +1309,25 @@ try_env_pass:
     mov al, [rsi + rcx]
     mov [rdi + rcx], al
     test al, al
-    jz .tep_found
+    jz .tep_scrub
     inc ecx
     cmp ecx, 255
     jl .tep_copy
     mov byte [rdi + 255], 0
+.tep_scrub:
+    ; Overwrite VAULT_PASS=… value bytes in envp memory.
+    ; rsi still points at the env value start. Walk and zero until null,
+    ; bounded by 4096 to avoid runaway in a corrupted environment block.
+    xor ecx, ecx
+.tep_scrub_loop:
+    mov al, [rsi + rcx]
+    test al, al
+    jz .tep_scrub_done
+    mov byte [rsi + rcx], 0
+    inc ecx
+    cmp ecx, 4096
+    jl .tep_scrub_loop
+.tep_scrub_done:
 .tep_found:
     mov eax, 1
     jmp .tep_ret
@@ -2968,11 +3273,12 @@ pbkdf2_sha256:
     ret
 
 ; ════════════════════════════════════════════════════════════════
-; CTR mode encrypt/decrypt (SHA-256 keystream XOR)
+; CTR mode encrypt/decrypt (SHA-256 keystream XOR) — legacy v1/v2/v3
 ;   rdi = key (32 bytes), rsi = iv (16 bytes)
 ;   rdx = input, rcx = input_len, r8 = output
+; Renamed to ctr_crypt_raw; ctr_crypt is now a version-aware wrapper.
 ; ════════════════════════════════════════════════════════════════
-ctr_crypt:
+ctr_crypt_raw:
     push rbx
     push r12
     push r13
@@ -3053,6 +3359,909 @@ ctr_crypt:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; cipher_crypt — version-aware entry cipher wrapper.
+; Args: same as ctr_crypt (rdi=key, rsi=iv, rdx=in, rcx=len, r8=out).
+;   v1/v2/v3: forwards to ctr_crypt (SHA-256 keystream).
+;   v4:       in-memory entries are plaintext (whole body is AEAD'd at
+;             file boundary). This becomes a plain memcpy.
+; ════════════════════════════════════════════════════════════════
+ctr_crypt:
+    cmp     word [rel g_vault_version], VAULT_VERSION_V4
+    je      .cc_v4
+    jmp     ctr_crypt_raw
+.cc_v4:
+    push    rsi
+    push    rdi
+    mov     rsi, rdx
+    mov     rdi, r8
+    rep     movsb
+    pop     rdi
+    pop     rsi
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; ChaCha20 block (RFC 8439 §2.3)
+;   rdi = key (32 bytes, treated as 8 LE u32)
+;   rsi = nonce (12 bytes, treated as 3 LE u32)
+;   edx = block counter (u32)
+;   r8  = output buffer (64 bytes, LE serialization)
+;
+; Builds initial state, copies to working state, runs 20 rounds
+; (10 double-rounds = column QRs + diagonal QRs), then adds the
+; original state into the working state and writes 16 LE u32s.
+; ════════════════════════════════════════════════════════════════
+
+%macro CHACHA_QR 4
+    ; Quarter-round on dwords [rbx + %1*4], [rbx + %2*4],
+    ; [rbx + %3*4], [rbx + %4*4]. Uses eax as scratch.
+    mov     eax, [rbx + %2*4]
+    add     [rbx + %1*4], eax
+    mov     eax, [rbx + %1*4]
+    xor     [rbx + %4*4], eax
+    rol     dword [rbx + %4*4], 16
+
+    mov     eax, [rbx + %4*4]
+    add     [rbx + %3*4], eax
+    mov     eax, [rbx + %3*4]
+    xor     [rbx + %2*4], eax
+    rol     dword [rbx + %2*4], 12
+
+    mov     eax, [rbx + %2*4]
+    add     [rbx + %1*4], eax
+    mov     eax, [rbx + %1*4]
+    xor     [rbx + %4*4], eax
+    rol     dword [rbx + %4*4], 8
+
+    mov     eax, [rbx + %4*4]
+    add     [rbx + %3*4], eax
+    mov     eax, [rbx + %3*4]
+    xor     [rbx + %2*4], eax
+    rol     dword [rbx + %2*4], 7
+%endmacro
+
+chacha20_block:
+    push    rbx
+    push    r12
+    push    r13
+
+    mov     r12, rdi                ; key ptr
+    mov     r13, r8                 ; output ptr
+
+    ; ── Build initial state in chacha_state ─────────────────
+    lea     rbx, [rel chacha_state]
+
+    ; Constants "expand 32-byte k" as 4 LE u32 (RFC §2.3)
+    mov     dword [rbx + 0*4], 0x61707865
+    mov     dword [rbx + 1*4], 0x3320646e
+    mov     dword [rbx + 2*4], 0x79622d32
+    mov     dword [rbx + 3*4], 0x6b206574
+
+    ; Key: 8 LE u32 copied straight from rdi (x86 loads are LE)
+    mov     eax, [r12 + 0]
+    mov     [rbx + 4*4], eax
+    mov     eax, [r12 + 4]
+    mov     [rbx + 5*4], eax
+    mov     eax, [r12 + 8]
+    mov     [rbx + 6*4], eax
+    mov     eax, [r12 + 12]
+    mov     [rbx + 7*4], eax
+    mov     eax, [r12 + 16]
+    mov     [rbx + 8*4], eax
+    mov     eax, [r12 + 20]
+    mov     [rbx + 9*4], eax
+    mov     eax, [r12 + 24]
+    mov     [rbx + 10*4], eax
+    mov     eax, [r12 + 28]
+    mov     [rbx + 11*4], eax
+
+    ; Counter and nonce
+    mov     [rbx + 12*4], edx
+    mov     eax, [rsi + 0]
+    mov     [rbx + 13*4], eax
+    mov     eax, [rsi + 4]
+    mov     [rbx + 14*4], eax
+    mov     eax, [rsi + 8]
+    mov     [rbx + 15*4], eax
+
+    ; ── Copy state → work (16 dwords) ────────────────────────
+    lea     rdi, [rel chacha_work]
+    mov     rsi, rbx
+    mov     ecx, 16
+    rep     movsd
+
+    ; Subsequent QRs operate on chacha_work via rbx
+    lea     rbx, [rel chacha_work]
+
+    ; ── 20 rounds = 10 double-rounds ─────────────────────────
+    mov     ecx, 10
+.round_loop:
+    CHACHA_QR 0, 4,  8, 12
+    CHACHA_QR 1, 5,  9, 13
+    CHACHA_QR 2, 6, 10, 14
+    CHACHA_QR 3, 7, 11, 15
+    CHACHA_QR 0, 5, 10, 15
+    CHACHA_QR 1, 6, 11, 12
+    CHACHA_QR 2, 7,  8, 13
+    CHACHA_QR 3, 4,  9, 14
+    dec     ecx
+    jnz     .round_loop
+
+    ; ── work[i] += state[i]; store as LE u32 to output ───────
+    lea     rsi, [rel chacha_state]
+    mov     rdi, r13
+    xor     ecx, ecx
+.add_loop:
+    mov     eax, [rbx + rcx*4]
+    add     eax, [rsi + rcx*4]
+    mov     [rdi + rcx*4], eax      ; x86 store is already LE
+    inc     ecx
+    cmp     ecx, 16
+    jne     .add_loop
+
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; ChaCha20 stream XOR (RFC 8439 §2.4)
+;   rdi = key (32)
+;   rsi = nonce (12)
+;   edx = initial block counter (u32)
+;   rcx = input ptr
+;   r8  = length in bytes
+;   r9  = output ptr
+;
+; Generates keystream blocks via chacha20_block and XORs them
+; into the input. Counter increments per 64-byte block.
+; ════════════════════════════════════════════════════════════════
+chacha20_xor:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     rbx, rdi                ; key
+    mov     r12, rsi                ; nonce
+    mov     r13d, edx               ; counter
+    mov     r14, rcx                ; input
+    mov     r15, r8                 ; remaining length
+    mov     rbp, r9                 ; output
+
+.blk_loop:
+    test    r15, r15
+    jz      .blk_done
+
+    ; Generate one 64-byte keystream block at chacha_block
+    mov     rdi, rbx
+    mov     rsi, r12
+    mov     edx, r13d
+    lea     r8, [rel chacha_block]
+    call    chacha20_block
+
+    ; XOR min(64, remaining) bytes
+    mov     rcx, 64
+    cmp     r15, 64
+    jae     .xor_full
+    mov     rcx, r15
+.xor_full:
+    lea     rsi, [rel chacha_block]
+    mov     rdi, rbp
+    mov     rdx, r14
+    push    rcx
+.xor_byte:
+    mov     al, [rdx]
+    xor     al, [rsi]
+    mov     [rdi], al
+    inc     rsi
+    inc     rdx
+    inc     rdi
+    dec     rcx
+    jnz     .xor_byte
+    pop     rcx
+
+    add     r14, rcx
+    add     rbp, rcx
+    sub     r15, rcx
+    inc     r13d
+    jmp     .blk_loop
+
+.blk_done:
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; Poly1305 internal: h ← (h * r) mod (2^130 - 5)
+; Reads poly_h (3 u64), poly_r (2 u64). Writes poly_h.
+; Clobbers rax, rcx, rdx, rsi, rdi, rbx, r12-r15. Preserves rbp.
+; Schoolbook 3x2 multiply → 5 limbs → fold high bits ×5.
+; ════════════════════════════════════════════════════════════════
+poly1305_mul:
+    ; T0=rbx, T1=r12, T2=r13, T3=r14, T4=r15
+    xor     r15d, r15d              ; T4
+
+    ; --- h0 * r0 ---
+    mov     rax, [rel poly_h + 0]
+    mul     qword [rel poly_r + 0]
+    mov     rbx, rax                ; T0
+    mov     r12, rdx                ; T1
+
+    ; --- h0 * r1 ---
+    mov     rax, [rel poly_h + 0]
+    mul     qword [rel poly_r + 8]
+    xor     r13d, r13d              ; T2 = 0
+    add     r12, rax
+    adc     r13, rdx
+
+    ; --- h1 * r0 ---
+    mov     rax, [rel poly_h + 8]
+    mul     qword [rel poly_r + 0]
+    xor     r14d, r14d              ; T3 = 0
+    add     r12, rax
+    adc     r13, rdx
+    adc     r14, 0
+
+    ; --- h1 * r1 ---
+    mov     rax, [rel poly_h + 8]
+    mul     qword [rel poly_r + 8]
+    add     r13, rax
+    adc     r14, rdx
+    adc     r15, 0
+
+    ; --- h2 * r0 ---
+    mov     rax, [rel poly_h + 16]
+    mul     qword [rel poly_r + 0]
+    add     r13, rax
+    adc     r14, rdx
+    adc     r15, 0
+
+    ; --- h2 * r1 ---
+    mov     rax, [rel poly_h + 16]
+    mul     qword [rel poly_r + 8]
+    add     r14, rax
+    adc     r15, rdx
+
+    ; ── Reduce: fold bits ≥ 130 back as ×5 ──────────────────
+    ; Result so far: (T4:T3:T2:T1:T0) at positions 0,64,128,192,256
+    ; Low part (bits 0..129): T0, T1, T2 & 3
+    ; High part (bits 130..): H0=(T3<<62)|(T2>>2), H1=(T4<<62)|(T3>>2), H2=T4>>2
+
+    mov     rcx, r13
+    and     rcx, 3                  ; rcx = h2_low = T2 & 3
+
+    shrd    r13, r14, 2             ; r13 = H0 = (T3:T2) >> 2 low 64
+    shrd    r14, r15, 2             ; r14 = H1 = (T4:T3) >> 2 low 64
+    shr     r15, 2                  ; r15 = H2 = T4 >> 2
+
+    mov     rsi, 5
+
+    ; T0 += (5*H0).lo;  T1 += (5*H0).hi (+ carry); h2_low += carry
+    mov     rax, r13
+    mul     rsi
+    add     rbx, rax
+    adc     r12, rdx
+    adc     rcx, 0
+
+    ; T1 += (5*H1).lo;  h2_low += (5*H1).hi (+ carry)
+    mov     rax, r14
+    mul     rsi
+    add     r12, rax
+    adc     rcx, rdx
+
+    ; h2_low += 5*H2  (5*H2 is small; H2 < 2^4 in practice)
+    mov     rax, r15
+    mul     rsi
+    add     rcx, rax
+    ; rdx assumed 0 here (H2*5 < 2^7); not folding further at this step
+
+    ; ── Second fold: rcx (h2) may exceed 2 bits ─────────────
+    mov     rax, rcx
+    shr     rax, 2                  ; rax = h2_overflow
+    and     rcx, 3                  ; rcx = final h2 (low 2 bits)
+    lea     rdx, [rax + rax*4]      ; rdx = 5 * overflow
+    add     rbx, rdx
+    adc     r12, 0
+    adc     rcx, 0
+
+    ; Store
+    mov     [rel poly_h + 0], rbx
+    mov     [rel poly_h + 8], r12
+    mov     [rel poly_h + 16], rcx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; Poly1305 streaming API + one-shot wrapper (RFC 8439 §2.5)
+; ════════════════════════════════════════════════════════════════
+
+; --- poly1305_init(rdi = key 32) -------------------------------
+poly1305_init:
+    mov     rax, [rdi + 0]
+    mov     rdx, [rdi + 8]
+    mov     rcx, 0x0ffffffc0fffffff
+    and     rax, rcx
+    mov     rcx, 0x0ffffffc0ffffffc
+    and     rdx, rcx
+    mov     [rel poly_r + 0], rax
+    mov     [rel poly_r + 8], rdx
+    mov     rax, [rdi + 16]
+    mov     rdx, [rdi + 24]
+    mov     [rel poly_s + 0], rax
+    mov     [rel poly_s + 8], rdx
+    xor     eax, eax
+    mov     [rel poly_h + 0], rax
+    mov     [rel poly_h + 8], rax
+    mov     [rel poly_h + 16], rax
+    ret
+
+; --- poly1305_blocks(rdi = msg, rsi = num_blocks) --------------
+; Process N complete 16-byte blocks (each with hi-bit 0x01 << 128).
+poly1305_blocks:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+    mov     rbp, rdi
+    mov     r8,  rsi
+.pb_loop:
+    test    r8, r8
+    jz      .pb_done
+    mov     rax, [rbp + 0]
+    mov     rdx, [rbp + 8]
+    add     [rel poly_h + 0], rax
+    adc     [rel poly_h + 8], rdx
+    adc     qword [rel poly_h + 16], 1
+    call    poly1305_mul
+    add     rbp, 16
+    dec     r8
+    jmp     .pb_loop
+.pb_done:
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; --- poly1305_partial(rdi = msg, rsi = partial_len 1..15) ------
+; Process one partial trailing block: zero-pad then set 0x01 at index partial_len.
+poly1305_partial:
+    test    rsi, rsi
+    jz      .pp_skip
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    xor     eax, eax
+    mov     [rel poly_buf + 0], rax
+    mov     [rel poly_buf + 8], rax
+
+    lea     rbp, [rel poly_buf]
+    mov     rcx, rsi
+.pp_copy:
+    test    rcx, rcx
+    jz      .pp_set
+    mov     al, [rdi]
+    mov     [rbp], al
+    inc     rdi
+    inc     rbp
+    dec     rcx
+    jmp     .pp_copy
+.pp_set:
+    mov     byte [rbp], 0x01
+    mov     rax, [rel poly_buf + 0]
+    mov     rdx, [rel poly_buf + 8]
+    add     [rel poly_h + 0], rax
+    adc     [rel poly_h + 8], rdx
+    adc     qword [rel poly_h + 16], 0
+    call    poly1305_mul
+
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+.pp_skip:
+    ret
+
+; --- poly1305_pad_block(rdi = msg, rsi = len 1..15) ------------
+; AEAD-style trailing block: zero-pad to 16, process as a FULL
+; block (hi-bit = 1<<128). Used for aad/ct final partial bytes
+; in chacha20_poly1305 seal/open.
+poly1305_pad_block:
+    test    rsi, rsi
+    jz      .pad_skip
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    xor     eax, eax
+    mov     [rel poly_buf + 0], rax
+    mov     [rel poly_buf + 8], rax
+
+    lea     rbp, [rel poly_buf]
+    mov     rcx, rsi
+.pad_copy:
+    test    rcx, rcx
+    jz      .pad_apply
+    mov     al, [rdi]
+    mov     [rbp], al
+    inc     rdi
+    inc     rbp
+    dec     rcx
+    jmp     .pad_copy
+.pad_apply:
+    mov     rax, [rel poly_buf + 0]
+    mov     rdx, [rel poly_buf + 8]
+    add     [rel poly_h + 0], rax
+    adc     [rel poly_h + 8], rdx
+    adc     qword [rel poly_h + 16], 1
+    call    poly1305_mul
+
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+.pad_skip:
+    ret
+
+; --- poly1305_finish(rdi = tag_out 16) -------------------------
+poly1305_finish:
+    push    rbx
+    push    r12
+    push    rdi                     ; save tag_out
+
+    ; Reduce: fold any residual h2 bits ≥ 2 back via ×5
+    mov     rcx, [rel poly_h + 16]
+    mov     rax, rcx
+    shr     rax, 2
+    and     rcx, 3
+    lea     rdx, [rax + rax*4]
+    mov     rbx, [rel poly_h + 0]
+    mov     r12, [rel poly_h + 8]
+    add     rbx, rdx
+    adc     r12, 0
+    adc     rcx, 0
+
+    ; Conditional subtract of p = 2^130 - 5
+    mov     rax, rbx
+    add     rax, 5
+    mov     rdx, r12
+    adc     rdx, 0
+    mov     rsi, rcx
+    adc     rsi, 0
+    mov     rdi, rsi
+    shr     rdi, 2                  ; nonzero = overflow past 2^130
+    test    rdi, rdi
+    jz      .pf_no_sub
+    mov     rbx, rax
+    mov     r12, rdx
+.pf_no_sub:
+
+    ; Add s, store low 128 bits as tag
+    add     rbx, [rel poly_s + 0]
+    adc     r12, [rel poly_s + 8]
+
+    pop     rdi
+    mov     [rdi + 0], rbx
+    mov     [rdi + 8], r12
+    pop     r12
+    pop     rbx
+    ret
+
+; --- poly1305_mac(rdi = key, rsi = msg, rdx = len, rcx = tag) --
+; One-shot wrapper.
+poly1305_mac:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+
+    mov     rbx, rsi                ; msg ptr
+    mov     r12, rdx                ; msg len
+    mov     r13, rcx                ; tag_out
+    mov     r14, rdi                ; key
+
+    mov     rdi, r14
+    call    poly1305_init
+
+    mov     rdi, rbx
+    mov     rsi, r12
+    shr     rsi, 4                  ; full blocks
+    call    poly1305_blocks
+
+    mov     rax, r12
+    and     rax, 15                 ; partial len
+    test    rax, rax
+    jz      .pm_no_partial
+    mov     rdi, r12
+    and     rdi, ~15
+    add     rdi, rbx                ; ptr to start of partial
+    mov     rsi, rax
+    call    poly1305_partial
+.pm_no_partial:
+
+    mov     rdi, r13
+    call    poly1305_finish
+
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; ChaCha20-Poly1305 AEAD seal (RFC 8439 §2.8.1)
+;   rdi = key (32)        rsi = nonce (12)
+;   rdx = aad ptr         rcx = aad len
+;   r8  = pt ptr          r9  = pt len
+; Output: in-place encrypt at [r8..r8+pt_len], 16-byte tag in poly_tag.
+;
+; Construction:
+;   otk        = chacha20_block(key, nonce, counter=0)[0..32]
+;   ciphertext = chacha20_xor(key, nonce, counter=1, plaintext)
+;   mac_data   = aad || pad16 || ct || pad16 || aad_len_le64 || ct_len_le64
+;   tag        = poly1305(otk, mac_data)
+; ════════════════════════════════════════════════════════════════
+chacha20_poly1305_seal:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     rbx, rdi                ; key
+    mov     r12, rsi                ; nonce
+    mov     r13, rdx                ; aad ptr
+    mov     r14, rcx                ; aad len
+    mov     r15, r8                 ; pt/ct ptr
+    mov     rbp, r9                 ; pt len
+
+    ; ── Derive OTK = first 32 bytes of chacha20_block(key, nonce, 0) ──
+    mov     rdi, rbx
+    mov     rsi, r12
+    xor     edx, edx
+    lea     r8, [rel chacha_block]
+    call    chacha20_block
+    mov     rax, [rel chacha_block + 0]
+    mov     [rel poly_otk + 0], rax
+    mov     rax, [rel chacha_block + 8]
+    mov     [rel poly_otk + 8], rax
+    mov     rax, [rel chacha_block + 16]
+    mov     [rel poly_otk + 16], rax
+    mov     rax, [rel chacha_block + 24]
+    mov     [rel poly_otk + 24], rax
+
+    ; ── Encrypt pt in place: chacha20_xor(key, nonce, ctr=1, pt, len, pt) ──
+    mov     rdi, rbx
+    mov     rsi, r12
+    mov     edx, 1
+    mov     rcx, r15
+    mov     r8,  rbp
+    mov     r9,  r15
+    call    chacha20_xor
+
+    ; ── Build MAC stream via Poly1305 ────────────────────────
+    lea     rdi, [rel poly_otk]
+    call    poly1305_init
+
+    ; AAD full blocks
+    mov     rdi, r13
+    mov     rsi, r14
+    shr     rsi, 4
+    call    poly1305_blocks
+    ; AAD partial
+    mov     rax, r14
+    and     rax, 15
+    test    rax, rax
+    jz      .seal_aad_done
+    mov     rdi, r14
+    and     rdi, -16
+    add     rdi, r13
+    mov     rsi, rax
+    call    poly1305_pad_block
+.seal_aad_done:
+
+    ; CT full blocks
+    mov     rdi, r15
+    mov     rsi, rbp
+    shr     rsi, 4
+    call    poly1305_blocks
+    ; CT partial
+    mov     rax, rbp
+    and     rax, 15
+    test    rax, rax
+    jz      .seal_ct_done
+    mov     rdi, rbp
+    and     rdi, -16
+    add     rdi, r15
+    mov     rsi, rax
+    call    poly1305_pad_block
+.seal_ct_done:
+
+    ; Length block = aad_len_le64 || ct_len_le64 (one full Poly1305 block)
+    mov     [rel poly_lens + 0], r14
+    mov     [rel poly_lens + 8], rbp
+    lea     rdi, [rel poly_lens]
+    mov     esi, 1
+    call    poly1305_blocks
+
+    ; Finish → poly_tag
+    lea     rdi, [rel poly_tag]
+    call    poly1305_finish
+
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; ChaCha20-Poly1305 AEAD open (RFC 8439 §2.8.1)
+;   rdi = key (32)        rsi = nonce (12)
+;   rdx = aad ptr         rcx = aad len
+;   r8  = ct ptr          r9  = ct len
+; Tag is expected at [r8 + r9 .. r8 + r9 + 16].
+;
+; Return: rax = 0 if tag valid (pt in [r8..r8+r9] after decrypt).
+;         rax = -1 if tag mismatch (buffer left UNCHANGED).
+;
+; Tag verified first; decryption happens only on valid tag.
+; Constant-time tag compare.
+; ════════════════════════════════════════════════════════════════
+chacha20_poly1305_open:
+    push    rbx
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rbp
+
+    mov     rbx, rdi                ; key
+    mov     r12, rsi                ; nonce
+    mov     r13, rdx                ; aad ptr
+    mov     r14, rcx                ; aad len
+    mov     r15, r8                 ; ct ptr
+    mov     rbp, r9                 ; ct len
+
+    ; ── 1. Derive OTK ────────────────────────────────────────
+    mov     rdi, rbx
+    mov     rsi, r12
+    xor     edx, edx
+    lea     r8, [rel chacha_block]
+    call    chacha20_block
+    mov     rax, [rel chacha_block + 0]
+    mov     [rel poly_otk + 0], rax
+    mov     rax, [rel chacha_block + 8]
+    mov     [rel poly_otk + 8], rax
+    mov     rax, [rel chacha_block + 16]
+    mov     [rel poly_otk + 16], rax
+    mov     rax, [rel chacha_block + 24]
+    mov     [rel poly_otk + 24], rax
+
+    ; ── 2. Compute MAC over received aad/ct/lens ─────────────
+    lea     rdi, [rel poly_otk]
+    call    poly1305_init
+
+    mov     rdi, r13
+    mov     rsi, r14
+    shr     rsi, 4
+    call    poly1305_blocks
+    mov     rax, r14
+    and     rax, 15
+    test    rax, rax
+    jz      .open_aad_done
+    mov     rdi, r14
+    and     rdi, -16
+    add     rdi, r13
+    mov     rsi, rax
+    call    poly1305_pad_block
+.open_aad_done:
+
+    mov     rdi, r15
+    mov     rsi, rbp
+    shr     rsi, 4
+    call    poly1305_blocks
+    mov     rax, rbp
+    and     rax, 15
+    test    rax, rax
+    jz      .open_ct_done
+    mov     rdi, rbp
+    and     rdi, -16
+    add     rdi, r15
+    mov     rsi, rax
+    call    poly1305_pad_block
+.open_ct_done:
+
+    mov     [rel poly_lens + 0], r14
+    mov     [rel poly_lens + 8], rbp
+    lea     rdi, [rel poly_lens]
+    mov     esi, 1
+    call    poly1305_blocks
+
+    lea     rdi, [rel poly_tag]
+    call    poly1305_finish
+
+    ; ── 3. Constant-time tag compare ─────────────────────────
+    ; Expected tag at [r15 + rbp .. + 16]; computed in poly_tag.
+    lea     rsi, [rel poly_tag]
+    lea     rdi, [r15 + rbp]
+    xor     eax, eax                ; accumulator (diff)
+    xor     ecx, ecx
+.open_cmp:
+    mov     dl, [rsi + rcx]
+    xor     dl, [rdi + rcx]
+    or      al, dl
+    inc     rcx
+    cmp     rcx, 16
+    jne     .open_cmp
+
+    test    al, al
+    jz      .open_decrypt
+
+    ; Tag mismatch — return -1 without touching ct buffer
+    mov     rax, -1
+    jmp     .open_ret
+
+.open_decrypt:
+    ; ── 4. Decrypt in place ──────────────────────────────────
+    mov     rdi, rbx
+    mov     rsi, r12
+    mov     edx, 1
+    mov     rcx, r15
+    mov     r8,  rbp
+    mov     r9,  r15
+    call    chacha20_xor
+    xor     eax, eax                ; rax = 0 success
+
+.open_ret:
+    pop     rbp
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; ════════════════════════════════════════════════════════════════
+; v4 file-format helpers
+;
+; Layout (offsets identical to v3 to minimize parser changes):
+;   [0..7]    magic
+;   [8..9]    version = 0x0004
+;   [10..25]  salt
+;   [26..29]  argon_iter
+;   [30..41]  ChaCha20-Poly1305 nonce (12 bytes)
+;   [42..61]  reserved (zero on write, ignored on read)
+;   [62..N-16]  AEAD ciphertext of plaintext body
+;             plaintext body = [entry_count(4)] || entries (same as v3)
+;   [N-16..N] 16-byte Poly1305 tag
+;
+; AAD = bytes [0..62] (full header including reserved field).
+; Key  = derived_key (post-keyfile if active).
+; ════════════════════════════════════════════════════════════════
+
+; seal_main_body_v4(rdi = plaintext body length)
+; Reads:  vault_buf[62..62+plain_len], derived_key, vault_buf header [0..62]
+; Writes: vault_buf[62..62+plain_len] (replaced by ciphertext),
+;         vault_buf[62+plain_len..62+plain_len+16] (tag),
+;         vault_buf[30..42] (fresh random nonce),
+;         vault_file_size = 62 + plain_len + 16.
+seal_main_body_v4:
+    push    rbx
+    push    r12
+    push    r13
+    mov     rbx, rdi                ; plain_len
+
+    ; Fresh nonce → header nonce slot, zero pad the reserved region
+    lea     rdi, [rel vault_buf + V4_NONCE_OFFSET]
+    mov     esi, V4_NONCE_LEN
+    call    get_random
+    lea     rdi, [rel vault_buf + V4_RESERVED_OFFSET]
+    mov     ecx, V4_RESERVED_LEN
+    xor     al, al
+    rep     stosb
+
+    ; chacha20_poly1305_seal(derived_key, nonce, aad=header[0..V4_HEADER_LEN], pt=body, pt_len)
+    lea     rdi, [rel derived_key]
+    lea     rsi, [rel vault_buf + V4_NONCE_OFFSET]
+    lea     rdx, [rel vault_buf]
+    mov     ecx, V4_HEADER_LEN
+    lea     r8,  [rel vault_buf + V4_HEADER_LEN]
+    mov     r9,  rbx
+    call    chacha20_poly1305_seal
+
+    ; Append tag from poly_tag → vault_buf[V4_HEADER_LEN + plain_len ..]
+    lea     rdi, [rel vault_buf + V4_HEADER_LEN]
+    add     rdi, rbx
+    lea     rsi, [rel poly_tag]
+    mov     ecx, V4_TAG_LEN
+    rep     movsb
+
+    ; Update vault_file_size = header + plain_len + tag
+    mov     rax, rbx
+    add     rax, V4_HEADER_LEN + V4_TAG_LEN
+    mov     [rel vault_file_size], rax
+
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
+; open_main_body_v4 — decrypt body in place, verify tag.
+; Reads:  vault_buf, vault_file_size, derived_key.
+; Writes: vault_buf[62..N-16] becomes plaintext on success.
+; Returns: rax = 0 on success, rax = -1 on tag mismatch / size error.
+open_main_body_v4:
+    ; ── Minimum file size for v4: header + entry_count(4) + tag ──
+    mov     rax, [rel vault_file_size]
+    cmp     rax, V4_HEADER_LEN + 4 + V4_TAG_LEN
+    jl      .ob_fail
+
+    ; ── Reject any nonzero byte in the reserved region [42..62] ──
+    ;    These bytes are authenticated by AAD, but enforcing the
+    ;    invariant here rejects malformed files before doing crypto
+    ;    and locks the format against subtle metadata smuggling.
+    ;    Use r10b as the accumulator (rax holds file_size — must not clobber).
+    lea     rsi, [rel vault_buf + V4_RESERVED_OFFSET]
+    mov     ecx, V4_RESERVED_LEN
+    xor     r10d, r10d
+.ob_check_zero:
+    or      r10b, [rsi]
+    inc     rsi
+    dec     ecx
+    jnz     .ob_check_zero
+    test    r10b, r10b
+    jnz     .ob_fail
+
+    ; ── AEAD-open the body in place ──
+    sub     rax, V4_HEADER_LEN + V4_TAG_LEN
+    mov     r9, rax                     ; ct_len (≥ 4 by check above)
+
+    push    r9
+    lea     rdi, [rel derived_key]
+    lea     rsi, [rel vault_buf + V4_NONCE_OFFSET]
+    lea     rdx, [rel vault_buf]
+    mov     ecx, V4_HEADER_LEN
+    lea     r8,  [rel vault_buf + V4_HEADER_LEN]
+    call    chacha20_poly1305_open
+    pop     r9
+    test    rax, rax
+    jnz     .ob_fail
+
+    ; Trim vault_file_size to header + plaintext body so entry-walk
+    ; callers (recalc_and_save) land at the right offset.
+    add     r9, V4_HEADER_LEN
+    mov     [rel vault_file_size], r9
+    xor     eax, eax
+    ret
+
+.ob_fail:
+    mov     rax, -1
     ret
 
 ; ════════════════════════════════════════════════════════════════
@@ -3163,6 +4372,185 @@ cmd_test_sha256:
     call exit
 
 ; ════════════════════════════════════════════════════════════════
+; ChaCha20 test command — runs RFC 8439 §2.3.2 block vector
+; ════════════════════════════════════════════════════════════════
+cmd_test_chacha20:
+    lea     rdi, [rel test_cc_hdr]
+    call    print_str
+
+    lea     rdi, [rel test_cc_232]
+    call    print_str
+
+    ; chacha20_block(key=cc_232_key, nonce=cc_232_nonce, ctr=1, out=chacha_block)
+    lea     rdi, [rel cc_232_key]
+    lea     rsi, [rel cc_232_nonce]
+    mov     edx, 1
+    lea     r8,  [rel chacha_block]
+    call    chacha20_block
+
+    ; Print actual 64-byte block (hex)
+    lea     rdi, [rel chacha_block]
+    mov     esi, 64
+    call    print_hex
+
+    ; Compare to expected
+    lea     rdi, [rel chacha_block]
+    lea     rsi, [rel cc_232_expected]
+    mov     ecx, 64
+    call    memcmp
+    test    eax, eax
+    jz      .cc_pass
+    lea     rdi, [rel test_fail]
+    call    print_str
+    jmp     .cc_done
+.cc_pass:
+    lea     rdi, [rel test_pass]
+    call    print_str
+
+    ; ── Poly1305 §2.5.2 ─────────────────────────────────────
+    lea     rdi, [rel test_p_252]
+    call    print_str
+
+    lea     rdi, [rel p_252_key]
+    lea     rsi, [rel p_252_msg]
+    mov     rdx, P_252_MSG_LEN
+    lea     rcx, [rel poly_tag]
+    call    poly1305_mac
+
+    lea     rdi, [rel poly_tag]
+    mov     esi, 16
+    call    print_hex
+
+    lea     rdi, [rel poly_tag]
+    lea     rsi, [rel p_252_expected]
+    mov     ecx, 16
+    call    memcmp
+    test    eax, eax
+    jz      .poly_pass
+    lea     rdi, [rel test_fail]
+    call    print_str
+    jmp     .cc_done
+.poly_pass:
+    lea     rdi, [rel test_pass]
+    call    print_str
+
+    ; ── AEAD §2.8.2 ─────────────────────────────────────────
+    lea     rdi, [rel test_a_282]
+    call    print_str
+
+    ; Copy plaintext into mutable scratch (seal encrypts in place)
+    lea     rdi, [rel aead_scratch]
+    lea     rsi, [rel a_282_pt]
+    mov     ecx, A_282_PT_LEN
+    rep     movsb
+
+    lea     rdi, [rel a_282_key]
+    lea     rsi, [rel a_282_nonce]
+    lea     rdx, [rel a_282_aad]
+    mov     ecx, A_282_AAD_LEN
+    lea     r8,  [rel aead_scratch]
+    mov     r9d, A_282_PT_LEN
+    call    chacha20_poly1305_seal
+
+    lea     rdi, [rel poly_tag]
+    mov     esi, 16
+    call    print_hex
+
+    lea     rdi, [rel poly_tag]
+    lea     rsi, [rel a_282_tag]
+    mov     ecx, 16
+    call    memcmp
+    test    eax, eax
+    jz      .aead_pass
+    lea     rdi, [rel test_fail]
+    call    print_str
+    jmp     .cc_done
+.aead_pass:
+    lea     rdi, [rel test_pass]
+    call    print_str
+
+    ; ── AEAD round-trip: open(seal(pt)) == pt, tag valid ─────
+    lea     rdi, [rel test_a_rt]
+    call    print_str
+
+    ; aead_scratch already holds ciphertext from seal; tag in poly_tag.
+    ; Copy tag right after ct so open can read it: aead_scratch[114..130] = poly_tag
+    lea     rdi, [rel aead_scratch + A_282_PT_LEN]
+    lea     rsi, [rel poly_tag]
+    mov     ecx, 16
+    rep     movsb
+
+    ; Open
+    lea     rdi, [rel a_282_key]
+    lea     rsi, [rel a_282_nonce]
+    lea     rdx, [rel a_282_aad]
+    mov     ecx, A_282_AAD_LEN
+    lea     r8,  [rel aead_scratch]
+    mov     r9d, A_282_PT_LEN
+    call    chacha20_poly1305_open
+
+    test    rax, rax
+    jnz     .rt_fail
+    ; Compare decrypted pt to original
+    lea     rdi, [rel aead_scratch]
+    lea     rsi, [rel a_282_pt]
+    mov     ecx, A_282_PT_LEN
+    call    memcmp
+    test    eax, eax
+    jnz     .rt_fail
+    lea     rdi, [rel test_pass]
+    call    print_str
+    jmp     .rt_tamper
+.rt_fail:
+    lea     rdi, [rel test_fail]
+    call    print_str
+    jmp     .cc_done
+
+.rt_tamper:
+    ; ── AEAD tamper-rejection: flip one tag byte, expect failure ──
+    lea     rdi, [rel test_a_tp]
+    call    print_str
+
+    ; Re-seal (since open just decrypted in place)
+    lea     rdi, [rel aead_scratch]
+    lea     rsi, [rel a_282_pt]
+    mov     ecx, A_282_PT_LEN
+    rep     movsb
+    lea     rdi, [rel a_282_key]
+    lea     rsi, [rel a_282_nonce]
+    lea     rdx, [rel a_282_aad]
+    mov     ecx, A_282_AAD_LEN
+    lea     r8,  [rel aead_scratch]
+    mov     r9d, A_282_PT_LEN
+    call    chacha20_poly1305_seal
+    ; Place tag, then flip one bit
+    lea     rdi, [rel aead_scratch + A_282_PT_LEN]
+    lea     rsi, [rel poly_tag]
+    mov     ecx, 16
+    rep     movsb
+    xor     byte [rel aead_scratch + A_282_PT_LEN], 0x01
+
+    lea     rdi, [rel a_282_key]
+    lea     rsi, [rel a_282_nonce]
+    lea     rdx, [rel a_282_aad]
+    mov     ecx, A_282_AAD_LEN
+    lea     r8,  [rel aead_scratch]
+    mov     r9d, A_282_PT_LEN
+    call    chacha20_poly1305_open
+    cmp     rax, -1
+    jne     .tp_fail
+    lea     rdi, [rel test_pass]
+    call    print_str
+    jmp     .cc_done
+.tp_fail:
+    lea     rdi, [rel test_fail]
+    call    print_str
+
+.cc_done:
+    xor     edi, edi
+    call    exit
+
+; ════════════════════════════════════════════════════════════════
 ; Vault Commands
 ; ════════════════════════════════════════════════════════════════
 
@@ -3188,10 +4576,11 @@ do_init:
     inc rcx
     jmp .init_opt_loop
 .init_bad_opt:
-    lea rdi, [rel msg_init_opt]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_bad_option]
+    lea rsi, [rel err_code_bad_option]
+    lea rdx, [rel msg_init_opt]
+    mov ecx, 2
+    call emit_err
 .init_opts_done:
 
     ; Check if vault file already exists
@@ -3307,15 +4696,23 @@ do_init:
     mov ecx, 8
     rep movsb
 
-    ; Version (2 bytes) — 0x0001 for PBKDF2, 0x0002 for Argon2id
+    ; Version (2 bytes) — v4 if --v4 was passed, else v3 default,
+    ; else v1 if --pbkdf2 was passed explicitly.
+    cmp byte [rel v4_flag], 0
+    jne .init_ver_v4
     cmp byte [rel argon2_use_argon2], 0
     je .init_ver_pbkdf2
-    mov word [rdi], VAULT_VERSION_ARGON2
+    mov word [rdi], VAULT_VERSION_V3
+    jmp .init_ver_done
+.init_ver_v4:
+    mov word [rdi], VAULT_VERSION_V4
     jmp .init_ver_done
 .init_ver_pbkdf2:
-    mov word [rdi], VAULT_VERSION
+    mov word [rdi], VAULT_VERSION_PBKDF2
 .init_ver_done:
-    add rdi, 2
+    mov ax, [rdi]               ; version word we just wrote
+    mov [rel g_vault_version], ax
+    add rdi, 2                  ; advance past version
 
     ; Salt (16 bytes)
     lea rsi, [rel vault_salt]
@@ -3356,16 +4753,34 @@ do_init:
     sub rdx, rdi
     sub rdx, HMAC_LEN       ; this doesn't look right
 
-    ; Simpler: HMAC position is at offset 30 (8+2+16+4)
-    ; Data to HMAC starts at offset 62 (30+32), covers entry_count + entries
-    ; Total size so far = 8+2+16+4+32+4 = 66
-    lea rdi, [rel derived_key]   ; key
-    mov rsi, 32                  ; key_len
+    ; Integrity step. v1/v2: HMAC over [62..66] entry_count only. v3:
+    ; HMAC over the 66-byte header with HMAC slot zeroed. v4: AEAD-seal
+    ; the 4-byte plaintext body and append tag.
+    movzx eax, word [rel vault_buf + 8]
+    cmp eax, VAULT_VERSION_V4
+    je .init_aead_v4
+    cmp eax, VAULT_VERSION_V3
+    je .init_hmac_v3
+
+    ; Legacy v1/v2
+    lea rdi, [rel derived_key]
+    mov rsi, 32
     lea rdx, [rel vault_buf]
-    add rdx, 62                  ; data starts after HMAC
-    mov rcx, 4                   ; just entry_count (0 entries)
+    add rdx, 62
+    mov rcx, 4
     lea r8, [rel vault_hmac]
     call hmac_sha256
+    jmp .init_hmac_done
+
+.init_hmac_v3:
+    lea rdi, [rel derived_key]
+    mov rsi, 32
+    lea rdx, [rel vault_buf]
+    mov rcx, 66
+    lea r8, [rel vault_hmac]
+    call hmac_sha256
+
+.init_hmac_done:
 
     ; Copy HMAC into buffer at offset 30
     pop rdi                 ; was HMAC position, but let's just use offset
@@ -3375,12 +4790,30 @@ do_init:
     mov ecx, HMAC_LEN
     rep movsb
 
-    ; Write file
+    ; Write file (v1/v2/v3 = 66 bytes)
     lea rdi, [rel vault_path]
     lea rsi, [rel vault_buf]
-    mov edx, 66            ; total: 8+2+16+4+32+4 = 66
+    mov edx, 66
     mov ecx, 0o600
     call write_file
+    jmp .init_post_write
+
+.init_aead_v4:
+    pop rdi                  ; discard saved HMAC position
+    ; Plaintext body = 4 bytes (entry_count=0 already at vault_buf+62).
+    ; seal_main_body_v4 generates the nonce, encrypts in place, appends
+    ; the tag, and sets vault_file_size = 82.
+    mov rdi, 4
+    call seal_main_body_v4
+
+    lea rdi, [rel vault_path]
+    lea rsi, [rel vault_buf]
+    mov rax, [rel vault_file_size]
+    mov edx, eax
+    mov ecx, 0o600
+    call write_file
+
+.init_post_write:
 
     ; Zero master password
     lea rdi, [rel master_pw]
@@ -3399,52 +4832,70 @@ do_init:
     call exit
 
 .init_exists:
-    lea rdi, [rel msg_init_exist]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_vault_exists]
+    lea rsi, [rel err_code_vault_exists]
+    lea rdx, [rel msg_init_exist]
+    mov ecx, 1
+    call emit_err
 
 .init_mismatch:
-    lea rdi, [rel msg_mismatch]
-    call print_str
     lea rdi, [rel master_pw]
     mov ecx, 256
     call zero_mem
     lea rdi, [rel master_pw2]
     mov ecx, 256
     call zero_mem
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_pw_mismatch]
+    lea rsi, [rel err_code_pw_mismatch]
+    lea rdx, [rel msg_mismatch]
+    mov ecx, 1
+    call emit_err
 
 ; ── Common error handlers (global labels for cross-function jumps) ──
 err_no_vault:
-    lea rdi, [rel msg_no_vault]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_no_vault]
+    lea rsi, [rel err_code_no_vault]
+    lea rdx, [rel msg_no_vault]
+    mov ecx, 1
+    call emit_err
 
 err_need_name:
-    lea rdi, [rel msg_no_name]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_need_name]
+    lea rsi, [rel err_code_need_name]
+    lea rdx, [rel msg_no_name]
+    mov ecx, 1
+    call emit_err
 
 err_not_found:
     call zero_sensitive
-    lea rdi, [rel msg_not_found]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_not_found]
+    lea rsi, [rel err_code_not_found]
+    lea rdx, [rel msg_not_found]
+    mov ecx, 1
+    call emit_err
 
 err_entry_exists:
     call zero_sensitive
-    lea rdi, [rel msg_exists]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_entry_exists]
+    lea rsi, [rel err_code_entry_exists]
+    lea rdx, [rel msg_exists]
+    mov ecx, 1
+    call emit_err
 
 err_list_empty:
+    ; Empty vault is a successful, structured result — emit JSON empty array
+    ; when --json, "(empty)" line to stderr otherwise. Exit 0.
+    cmp byte [rel output_json], 0
+    jne .ele_json
+    call argv_scan_json_flag
+    test eax, eax
+    jnz .ele_json
     lea rdi, [rel msg_empty]
+    call print_err
+    xor edi, edi
+    call exit
+.ele_json:
+    lea rdi, [rel json_empty_arr]
     call print_str
     xor edi, edi
     call exit
@@ -3687,7 +5138,7 @@ do_add:
     call strcmp
     pop rcx
     test eax, eax
-    jnz .add_bad_opt
+    jnz .check_output_flags
     mov rax, [rel argc]
     lea rdx, [rcx + 1]
     cmp rdx, rax
@@ -3702,17 +5153,52 @@ do_add:
     add rcx, 2
     jmp .add_opt_loop
 
+.check_output_flags:
+    ; Accept --raw / --json / --exact silently — they're handled later by
+    ; emit_ok_simple via argv scan. Without this, an agent passing --json
+    ; would hit "unsupported option".
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel raw_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jz .add_consume_one
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel json_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jz .add_consume_one
+    mov rax, [rel argv]
+    mov rdi, [rax + rcx*8]
+    lea rsi, [rel exact_flag]
+    push rcx
+    call strcmp
+    pop rcx
+    test eax, eax
+    jz .add_consume_one
+    jmp .add_bad_opt
+.add_consume_one:
+    inc rcx
+    jmp .add_opt_loop
+
 .add_missing_value:
-    lea rdi, [rel msg_opt_value]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_missing_value]
+    lea rsi, [rel err_code_missing_value]
+    lea rdx, [rel msg_opt_value]
+    mov ecx, 2
+    call emit_err
 
 .add_bad_opt:
-    lea rdi, [rel msg_add_opt]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_bad_option]
+    lea rsi, [rel err_code_bad_option]
+    lea rdx, [rel msg_add_opt]
+    mov ecx, 2
+    call emit_err
 
 .add_opts_done:
 
@@ -3792,23 +5278,37 @@ do_add:
     ; Append entry to vault buffer, recompute HMAC, write back
     call append_entry_and_save
 
-    ; Show password strength
+    ; Show password strength — skip in agent mode (--raw/--json) to keep stdout clean
+    call argv_scan_exact_mode    ; reuses the same scan (covers --raw/--json/--exact)
+    test eax, eax
+    jnz .add_skip_strength
     lea rdi, [rel entry_pass]
     call print_strength
+.add_skip_strength:
 
     ; Zero sensitive data
     call zero_sensitive
 
     lea rdi, [rel msg_added]
-    call print_str
-    xor edi, edi
-    call exit
+    call emit_ok_simple
 
 ; ── vault get <name> [field] ─────────────────────────────────
 do_get:
     mov rax, [rel argc]
     cmp rax, 3
     jl err_need_name
+
+    ; Reject "vault get --json" / "vault get --raw" etc. — argv[2] must be a name,
+    ; not a flag. Without this, "--json" was being treated as an entry name and
+    ; failing with not_found instead of need_name.
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    cmp byte [rdi], '-'
+    jne .get_name_ok
+    cmp byte [rdi+1], '-'
+    jne .get_name_ok
+    jmp err_need_name
+.get_name_ok:
 
     mov rax, [rel argv]
     mov rsi, [rax+16]       ; argv[2] = source
@@ -3820,9 +5320,18 @@ do_get:
 
     call open_vault
 
-    ; Find entry (fuzzy)
+    ; Lookup: exact when --raw/--json/--exact is in argv (agent-safe contract);
+    ; fuzzy otherwise (preserves human ergonomics).
+    call argv_scan_exact_mode
+    test eax, eax
+    jnz .get_exact_lookup
     lea rdi, [rel entry_name]
     call find_entry_fuzzy
+    jmp .get_lookup_done
+.get_exact_lookup:
+    lea rdi, [rel entry_name]
+    call find_entry
+.get_lookup_done:
     test rax, rax
     jz err_not_found
 
@@ -3842,27 +5351,41 @@ do_get:
 
     ; Check if field specified (argc >= 4)
     xor r12d, r12d          ; field pointer
-    mov edi, 3
     mov rax, [rel argc]
     cmp rax, 4
-    jl .get_flags_only
+    jl .get_no_field
 
     mov rax, [rel argv]
     mov rdi, [rax+24]       ; argv[3]
     lea rsi, [rel raw_flag]
     call strcmp
     test eax, eax
-    jz .get_flags_only
+    jz .get_no_field
     mov rax, [rel argv]
     mov rdi, [rax+24]
     lea rsi, [rel json_flag]
     call strcmp
     test eax, eax
-    jz .get_flags_only
+    jz .get_no_field
 
+    ; If argv[3] starts with "--" but wasn't recognized, treat it as a flag
+    ; for parse_output_flags so it can reject (rather than silently treating
+    ; "--bogus" as a field name).
+    mov rax, [rel argv]
+    mov rdi, [rax+24]
+    cmp byte [rdi], '-'
+    jne .get_have_field
+    cmp byte [rdi+1], '-'
+    jne .get_have_field
+    jmp .get_no_field
+.get_have_field:
     mov rax, [rel argv]
     mov r12, [rax+24]       ; field argument
     mov edi, 4
+    jmp .get_flags_only
+
+.get_no_field:
+    mov edi, 3
 
 .get_flags_only:
     call parse_output_flags
@@ -4275,9 +5798,7 @@ do_rm:
 
     call zero_sensitive
     lea rdi, [rel msg_removed]
-    call print_str
-    xor edi, edi
-    call exit
+    call emit_ok_simple
 
 ; ── vault export ─────────────────────────────────────────────
 do_export:
@@ -5466,10 +6987,11 @@ do_clip:
     call exit
 
 .clip_err:
-    lea rdi, [rel msg_no_xclip]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_no_xclip]
+    lea rsi, [rel err_code_no_xclip]
+    lea rdx, [rel msg_no_xclip]
+    mov ecx, 1
+    call emit_err
 
 ; ════════════════════════════════════════════════════════════════
 ; L3 Commands
@@ -5702,12 +7224,11 @@ do_totp:
 
 .totp_no_secret:
     call zero_sensitive
-    lea rdi, [rel msg_totp_none]
-    call print_str
-    lea rdi, [rel msg_totp_hint]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_no_totp]
+    lea rsi, [rel err_code_no_totp]
+    lea rdx, [rel msg_totp_none]
+    mov ecx, 1
+    call emit_err
 
 ; ════════════════════════════════════════════════════════════════
 ; L4 Commands
@@ -5789,7 +7310,12 @@ do_wipe:
     xor edi, edi
     call exit
 
-; ── vault unlock — cache derived key for session ─────────────
+; ── vault unlock — stash derived key in Linux kernel keyring ─
+; Pre-hardening: the key was written to /tmp/.vault-session-<uid> in plaintext.
+; Now: add_key(2) places the 32-byte key in the user session keyring under
+; description "vault:session". keyctl_set_timeout(SESSION_TIMEOUT) caps the
+; window. The on-disk stub only holds the keyring serial — useless to any
+; reader who can't also issue keyctl_read against the same uid.
 do_unlock:
     call open_vault
     call build_session_path
@@ -5798,14 +7324,49 @@ do_unlock:
     mov ecx, 128
     call zero_mem
 
+    ; add_key("user", "vault:session:<hmac8>", derived_key, 32, SESSION_KEYRING)
+    ; Description is per-vault so concurrent --vault-path vaults don't collide.
+    ; Linux x86-64 syscall ABI: arg4 → r10, NOT rcx (rcx is clobbered by syscall).
+    call build_keyring_desc
+    lea rdi, [rel key_type_user]
+    lea rsi, [rel keyring_desc]
+    lea rdx, [rel derived_key]
+    mov r10, 32
+    mov r8, KEY_SPEC_SESSION_KEYRING
+    mov eax, SYS_ADD_KEY
+    syscall
+    test rax, rax
+    js .unlock_keyring_fail        ; negative errno → keyring unavailable
+
+    ; Save the serial for the stub
+    mov [rel session_buf + SESSION_SERIAL_OFFSET], eax
+
+    ; keyctl(KEYCTL_SET_TIMEOUT, serial, SESSION_TIMEOUT)
+    mov edi, KEYCTL_SET_TIMEOUT
+    mov esi, eax                   ; serial
+    mov edx, SESSION_TIMEOUT
+    mov eax, SYS_KEYCTL
+    syscall
+    ; Ignore timeout-set failure: worst case the key persists until the
+    ; user logs out, which is the default keyring lifetime anyway.
+
+    ; Build stub
     call get_now_seconds
     add rax, SESSION_TIMEOUT
     mov [rel session_buf + SESSION_EXPIRY_OFFSET], rax
 
-    lea rsi, [rel vault_buf + 30]
+    ; Session identifier: 16-byte salt (stable for the vault's lifetime).
+    ; Earlier scheme used the 32-byte HMAC slot, which changed on every save
+    ; and invalidated sessions after any write.
+    lea rsi, [rel vault_buf + 10]
     lea rdi, [rel session_buf + SESSION_VAULT_HMAC_OFFSET]
-    mov ecx, HMAC_LEN
+    mov ecx, SALT_LEN
     rep movsb
+    ; Zero the remaining bytes of the slot so the on-disk stub is deterministic.
+    mov ecx, HMAC_LEN
+    sub ecx, SALT_LEN
+    xor al, al
+    rep stosb
 
     mov al, [rel keyfile_active]
     mov [rel session_buf + SESSION_KEYFILE_FLAG_OFFSET], al
@@ -5819,11 +7380,6 @@ do_unlock:
     rep movsb
 
 .unlock_no_keyfile:
-    lea rsi, [rel derived_key]
-    lea rdi, [rel session_buf + SESSION_KEY_OFFSET]
-    mov ecx, KEY_LEN
-    rep movsb
-
     lea rdi, [rel session_path]
     lea rsi, [rel session_buf]
     mov edx, SESSION_FILE_SIZE
@@ -5838,39 +7394,329 @@ do_unlock:
     call zero_mem
 
     lea rdi, [rel msg_unlocked]
-    call print_str
-    xor edi, edi
-    call exit
+    call emit_ok_simple
 
 .unlock_write_fail:
     lea rdi, [rel session_buf]
     mov ecx, 128
     call zero_mem
-    lea rdi, [rel msg_session_write_fail]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_session_write]
+    lea rsi, [rel err_code_session_write]
+    lea rdx, [rel msg_session_write_fail]
+    mov ecx, 1
+    call emit_err
 
-; ── vault lock — clear session ───────────────────────────────
+.unlock_keyring_fail:
+    lea rdi, [rel session_buf]
+    mov ecx, 128
+    call zero_mem
+    lea rdi, [rel err_msg_keyring]
+    lea rsi, [rel err_code_keyring]
+    lea rdx, [rel msg_keyring_unavailable]
+    mov ecx, 1
+    call emit_err
+
+; ── vault lock — clear session keyring entry + wipe stub ────
 do_lock:
+    ; Load vault file so build_session_path can derive the per-vault hex suffix.
+    ; If the vault file is missing, no session to clear; treat as no-op success.
+    call read_vault_file
+    test rax, rax
+    jz .lock_no_session
+    mov [rel vault_file_size], rax
     call build_session_path
     lea rdi, [rel session_path]
     call file_exists
     test eax, eax
     jz .lock_no_session
 
+    ; Read the stub to recover the keyring serial, then invalidate the key.
+    ; If the stub is unreadable or wrong size we still wipe the file.
+    lea rdi, [rel session_path]
+    lea rsi, [rel session_buf]
+    mov edx, SESSION_FILE_SIZE
+    call read_file
+    cmp eax, SESSION_FILE_SIZE
+    jne .lock_wipe_only
+    mov esi, [rel session_buf + SESSION_SERIAL_OFFSET]
+    test esi, esi
+    jz .lock_wipe_only
+    mov edi, KEYCTL_INVALIDATE
+    mov eax, SYS_KEYCTL
+    syscall
+    ; Ignore failure — wipe stub anyway
+
+.lock_wipe_only:
     call wipe_session_file
 
     lea rdi, [rel msg_locked]
+    call emit_ok_simple
+
+.lock_no_session:
+    ; "no active session" is a success state for lock (idempotent), so emit ok.
+    lea rdi, [rel msg_no_session]
+    call emit_ok_simple
+
+; ── vault status [--json] ─────────────────────────────────────
+; Inspect vault metadata without prompting for the master password.
+; Reports: path, exists, version (1=PBKDF2, 2=Argon2id, 0=missing),
+; kdf, entry count, session_active.
+do_status:
+    mov edi, 2
+    call parse_output_flags
+
+    ; Reset stats — use r12-r15 to hold values across prints
+    ; r12 = exists (0/1), r13 = version (0/1/2), r14 = entry count, r15 = session_active
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+
+    ; Check vault file existence
+    lea rdi, [rel vault_path]
+    call file_exists
+    test eax, eax
+    jz .stat_no_vault
+    mov r12d, 1
+
+    ; Read first 66 bytes for magic, version, and entry count
+    lea rdi, [rel vault_path]
+    lea rsi, [rel vault_buf]
+    mov edx, 66
+    call read_file
+    cmp eax, 66
+    jl .stat_no_vault          ; treat truncated as missing for metadata purposes
+
+    ; Read version (word at offset 8)
+    movzx eax, word [rel vault_buf + 8]
+    mov r13d, eax
+
+    ; Read entry count (dword at offset 62)
+    mov eax, [rel vault_buf + 62]
+    mov r14d, eax
+
+.stat_no_vault:
+    ; Check session
+    call build_session_path
+    lea rdi, [rel session_path]
+    call file_exists
+    test eax, eax
+    jz .stat_no_session
+    mov r15d, 1
+.stat_no_session:
+
+    cmp byte [rel output_json], 0
+    jne .stat_json
+
+    ; ── plain output ──
+    lea rdi, [rel status_label_path]
     call print_str
+    lea rdi, [rel vault_path]
+    call print_str
+    lea rdi, [rel msg_newline]
+    call print_str
+
+    lea rdi, [rel status_label_exists]
+    call print_str
+    test r12d, r12d
+    jz .stat_plain_exists_no
+    lea rdi, [rel status_yes]
+    jmp .stat_plain_exists_done
+.stat_plain_exists_no:
+    lea rdi, [rel status_no]
+.stat_plain_exists_done:
+    call print_str
+
+    lea rdi, [rel status_label_version]
+    call print_str
+    cmp r13d, 1
+    je .stat_plain_v1
+    cmp r13d, 2
+    je .stat_plain_v2
+    cmp r13d, 3
+    je .stat_plain_v3
+    lea rdi, [rel status_v0]
+    jmp .stat_plain_v_done
+.stat_plain_v1:
+    lea rdi, [rel status_v1]
+    jmp .stat_plain_v_done
+.stat_plain_v2:
+    lea rdi, [rel status_v2]
+    jmp .stat_plain_v_done
+.stat_plain_v3:
+    lea rdi, [rel status_v3]
+.stat_plain_v_done:
+    call print_str
+
+    lea rdi, [rel status_label_kdf]
+    call print_str
+    cmp r13d, 1
+    je .stat_plain_kdf_p
+    cmp r13d, 2
+    je .stat_plain_kdf_a
+    cmp r13d, 3
+    je .stat_plain_kdf_a
+    lea rdi, [rel status_kdf_unknown]
+    jmp .stat_plain_kdf_done
+.stat_plain_kdf_p:
+    lea rdi, [rel status_kdf_pbkdf2]
+    jmp .stat_plain_kdf_done
+.stat_plain_kdf_a:
+    lea rdi, [rel status_kdf_argon2]
+.stat_plain_kdf_done:
+    call print_str
+
+    lea rdi, [rel status_label_entries]
+    call print_str
+    mov eax, r14d
+    lea rdi, [rel status_numbuf]
+    call itoa
+    lea rdi, [rel status_numbuf]
+    call print_str
+    lea rdi, [rel msg_newline]
+    call print_str
+
+    lea rdi, [rel status_label_session]
+    call print_str
+    test r15d, r15d
+    jz .stat_plain_session_no
+    lea rdi, [rel status_yes]
+    jmp .stat_plain_session_done
+.stat_plain_session_no:
+    lea rdi, [rel status_no]
+.stat_plain_session_done:
+    call print_str
+
     xor edi, edi
     call exit
 
-.lock_no_session:
-    lea rdi, [rel msg_no_session]
+.stat_json:
+    ; ── JSON output: single-line object ──
+    mov al, '{'
+    call print_char
+    lea rdi, [rel json_status_path]
     call print_str
+    lea rdi, [rel vault_path]
+    call print_json_quoted_body    ; writes raw escaped body to stdout (no quotes)
+    lea rdi, [rel json_status_exists]
+    call print_str
+    test r12d, r12d
+    jnz .stat_json_exists_yes
+    lea rdi, [rel json_false_word]
+    jmp .stat_json_exists_done
+.stat_json_exists_yes:
+    lea rdi, [rel json_true_word]
+.stat_json_exists_done:
+    call print_str
+
+    lea rdi, [rel json_status_version]
+    call print_str
+    mov eax, r13d
+    lea rdi, [rel status_numbuf]
+    call itoa
+    lea rdi, [rel status_numbuf]
+    call print_str
+
+    lea rdi, [rel json_status_kdf]
+    call print_str
+    cmp r13d, 1
+    je .stat_json_kdf_p
+    cmp r13d, 2
+    je .stat_json_kdf_a
+    cmp r13d, 3
+    je .stat_json_kdf_a
+    lea rdi, [rel json_kdf_unknown_word]
+    jmp .stat_json_kdf_done
+.stat_json_kdf_p:
+    lea rdi, [rel json_kdf_pbkdf2_word]
+    jmp .stat_json_kdf_done
+.stat_json_kdf_a:
+    lea rdi, [rel json_kdf_argon2_word]
+.stat_json_kdf_done:
+    call print_str
+
+    lea rdi, [rel json_status_entries]
+    call print_str
+    mov eax, r14d
+    lea rdi, [rel status_numbuf]
+    call itoa
+    lea rdi, [rel status_numbuf]
+    call print_str
+
+    lea rdi, [rel json_status_session]
+    call print_str
+    test r15d, r15d
+    jnz .stat_json_session_yes
+    lea rdi, [rel json_false_close]
+    jmp .stat_json_session_done
+.stat_json_session_yes:
+    lea rdi, [rel json_true_close]
+.stat_json_session_done:
+    call print_str
+
     xor edi, edi
     call exit
+
+; print_json_quoted_body — write JSON-escaped chars (no surrounding quotes) to STDOUT
+;   rdi = null-terminated string
+print_json_quoted_body:
+    push rbx
+    mov rbx, rdi
+.pjqb_loop:
+    mov al, [rbx]
+    test al, al
+    jz .pjqb_done
+    cmp al, '"'
+    je .pjqb_q
+    cmp al, 92
+    je .pjqb_bs
+    cmp al, 10
+    je .pjqb_n
+    cmp al, 13
+    je .pjqb_r
+    cmp al, 9
+    je .pjqb_t
+    cmp al, 0x20
+    jl .pjqb_skip
+    call print_char
+    jmp .pjqb_next
+.pjqb_q:
+    mov al, 92
+    call print_char
+    mov al, '"'
+    call print_char
+    jmp .pjqb_next
+.pjqb_bs:
+    mov al, 92
+    call print_char
+    mov al, 92
+    call print_char
+    jmp .pjqb_next
+.pjqb_n:
+    mov al, 92
+    call print_char
+    mov al, 'n'
+    call print_char
+    jmp .pjqb_next
+.pjqb_r:
+    mov al, 92
+    call print_char
+    mov al, 'r'
+    call print_char
+    jmp .pjqb_next
+.pjqb_t:
+    mov al, 92
+    call print_char
+    mov al, 't'
+    call print_char
+    jmp .pjqb_next
+.pjqb_skip:
+.pjqb_next:
+    inc rbx
+    jmp .pjqb_loop
+.pjqb_done:
+    pop rbx
+    ret
 
 ; ── vault hidden <subcmd> [args] — plausible deniability ─────
 ; Hidden vault is appended to the main vault file.
@@ -5884,6 +7730,29 @@ do_lock:
 ; Without the hidden password, the hidden data looks like random padding.
 ; ── vault migrate — re-encrypt all entries with new format ────
 do_migrate:
+    ; Dispatch:
+    ;   migrate --upgrade-kdf  → v1/PBKDF2 → v3/Argon2id
+    ;   migrate --upgrade-aead → v1/v2/v3 → v4 (ChaCha20-Poly1305 AEAD)
+    ;   migrate                → legacy per-entry re-encode (adds TOTP field)
+    mov rax, [rel argc]
+    cmp rax, 3
+    jl .migrate_legacy
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel upgrade_kdf_flag]
+    call strcmp
+    test eax, eax
+    je .do_upgrade_kdf
+    mov rax, [rel argv]
+    mov rdi, [rax+16]
+    lea rsi, [rel upgrade_aead_flag]
+    call strcmp
+    test eax, eax
+    je do_migrate_upgrade_aead
+    jmp .migrate_legacy
+.do_upgrade_kdf:
+    jmp do_migrate_upgrade_kdf
+.migrate_legacy:
     call open_vault
 
     lea rsi, [rel vault_buf]
@@ -5991,7 +7860,341 @@ do_migrate:
     xor edi, edi
     call exit
 
+; ── vault migrate --upgrade-kdf ──────────────────────────────
+; Re-key a v1/v2 vault to v3: Argon2id KDF + authenticated full header.
+; Strategy:
+;   1. Open with old KDF → derived_key holds old key
+;   2. Snapshot the ciphertext entry section to migrate_old_entries
+;   3. Generate new salt, derive new Argon2id key into migrate_new_key
+;   4. Reset header: version=v3, new salt, HMAC slot zero, entry_count=0
+;   5. Walk old entries: temp-swap derived_key=old, decrypt each, swap to new,
+;      append via append_entry_and_save (which recomputes v3 HMAC)
+;   6. Done — vault is now v3
+do_migrate_upgrade_kdf:
+    call open_vault
+
+    ; Refuse if already v3+
+    movzx eax, word [rel vault_buf + 8]
+    cmp eax, VAULT_VERSION_V3
+    jl .muk_proceed
+    lea rdi, [rel msg_migrate_already_v3]
+    call print_str
+    xor edi, edi
+    call exit
+.muk_proceed:
+
+    ; Snapshot the entry section size
+    mov rax, [rel vault_file_size]
+    sub rax, 66
+    cmp rax, 65536
+    jbe .muk_size_ok
+    lea rdi, [rel msg_migrate_too_big]
+    call print_err
+    mov edi, 1
+    call exit
+.muk_size_ok:
+    mov [rel migrate_old_entries_size], rax
+
+    ; Save old entry count and entries section
+    mov eax, [rel vault_buf + 62]
+    mov [rel migrate_old_entry_count], eax
+    lea rsi, [rel vault_buf + 66]
+    lea rdi, [rel migrate_old_entries]
+    mov rcx, [rel migrate_old_entries_size]
+    rep movsb
+
+    ; Save old derived_key
+    lea rsi, [rel derived_key]
+    lea rdi, [rel migrate_old_key]
+    mov ecx, 32
+    rep movsb
+
+    ; ── Build v3 header in vault_buf ──
+    mov word [rel vault_buf + 8], VAULT_VERSION_V3
+
+    ; New salt → vault_buf[10..26] and vault_salt
+    lea rdi, [rel vault_buf + 10]
+    mov esi, 16
+    call get_random
+    lea rsi, [rel vault_buf + 10]
+    lea rdi, [rel vault_salt]
+    mov ecx, 16
+    rep movsb
+
+    ; Keep iter field as-is (unused for v3, but preserve sane value)
+    mov dword [rel vault_buf + 26], PBKDF2_ITER
+
+    ; Zero HMAC slot + entry_count
+    lea rdi, [rel vault_buf + 30]
+    mov ecx, 32
+    xor al, al
+    rep stosb
+    mov dword [rel vault_buf + 62], 0
+    mov qword [rel vault_file_size], 66
+
+    ; Derive new Argon2id key with new salt
+    lea rdi, [rel master_pw]
+    call strlen
+    mov r12, rax
+    lea rdi, [rel master_pw]
+    mov rsi, r12
+    lea rdx, [rel vault_salt]
+    mov ecx, 16
+    lea r8, [rel derived_key]
+    call argon2id_hash
+
+    ; Apply keyfile XOR if active (mirrors open_vault behavior)
+    cmp byte [rel keyfile_active], 0
+    je .muk_no_keyfile
+    call apply_keyfile
+.muk_no_keyfile:
+
+    ; Save the new derived key for swap during the re-encrypt loop
+    lea rsi, [rel derived_key]
+    lea rdi, [rel migrate_new_key]
+    mov ecx, 32
+    rep movsb
+
+    ; ── Walk old entries: decrypt with old key, append with new key ──
+    ; Cursor goes in memory (migrate_cursor) because the helpers we call
+    ; (append_entry_and_save in particular) overwrite r13/r14 as scratch.
+    mov eax, [rel migrate_old_entry_count]
+    mov [rel migrate_remaining], eax
+    lea rax, [rel migrate_old_entries]
+    mov [rel migrate_cursor], rax
+
+.muk_walk:
+    mov eax, [rel migrate_remaining]
+    test eax, eax
+    jz .muk_walk_done
+
+    ; Swap derived_key ← migrate_old_key, then decrypt this entry
+    lea rsi, [rel migrate_old_key]
+    lea rdi, [rel derived_key]
+    mov ecx, 32
+    rep movsb
+
+    ; Decrypt entry at migrate_cursor → fills entry_user/pass/url/notes/totp
+    mov rsi, [rel migrate_cursor]
+    call decrypt_entry
+
+    ; Set entry_name from cursor (decrypt_entry doesn't touch entry_name)
+    mov rsi, [rel migrate_cursor]
+    mov eax, [rsi]              ; name_len
+    add rsi, 4
+    mov edx, eax                ; preserve length for terminator
+    lea rdi, [rel entry_name]
+    mov ecx, eax
+    rep movsb
+    mov byte [rdi + rdx], 0     ; null terminator
+
+    ; Advance cursor past this entry: 4 + name_len + 4 + IV(16) + enc_data_len
+    mov rax, [rel migrate_cursor]
+    mov ecx, [rax]              ; name_len
+    add rax, 4
+    add rax, rcx                ; past name
+    mov ecx, [rax]              ; enc_data_len
+    add rax, 4                  ; past enc_data_len field
+    add rax, IV_LEN             ; past IV
+    add rax, rcx                ; past ciphertext
+    mov [rel migrate_cursor], rax
+
+    ; Swap derived_key ← migrate_new_key for re-encrypt
+    lea rsi, [rel migrate_new_key]
+    lea rdi, [rel derived_key]
+    mov ecx, 32
+    rep movsb
+
+    ; Re-pack and re-encrypt (mirrors do_add's append path)
+    call pack_entry_data
+    ; pack_entry_data returns plaintext length in rax. append_entry_and_save
+    ; reads r14d as the ciphertext length (same value since CTR mode), so:
+    mov r14d, eax
+
+    lea rdi, [rel iv_buf]
+    mov esi, IV_LEN
+    call get_random
+
+    lea rdi, [rel derived_key]
+    lea rsi, [rel iv_buf]
+    lea rdx, [rel entry_data]
+    mov ecx, r14d
+    lea r8, [rel crypt_buf]
+    call ctr_crypt
+
+    call append_entry_and_save
+
+    dec dword [rel migrate_remaining]
+    jmp .muk_walk
+
+.muk_walk_done:
+    ; Wipe scratch
+    lea rdi, [rel migrate_old_key]
+    mov ecx, 32
+    xor al, al
+    rep stosb
+    lea rdi, [rel migrate_new_key]
+    mov ecx, 32
+    xor al, al
+    rep stosb
+    lea rdi, [rel migrate_old_entries]
+    mov rcx, [rel migrate_old_entries_size]
+    xor al, al
+    rep stosb
+
+    call zero_sensitive
+
+    lea rdi, [rel msg_migrate_upgrade_ok]
+    call print_str
+    xor edi, edi
+    call exit
+
+; ════════════════════════════════════════════════════════════════
+; vault migrate --upgrade-aead — convert v1/v2/v3 vault to v4
+; (ChaCha20-Poly1305 AEAD). Each entry's per-entry CTR ciphertext is
+; decrypted in place to plaintext (entry layout unchanged), then the
+; whole body is re-sealed under AEAD on save.
+;
+; Refuses to migrate if a hidden section exists (hidden vaults are not
+; yet supported under v4).
+; ════════════════════════════════════════════════════════════════
+do_migrate_upgrade_aead:
+    call open_vault
+
+    ; Refuse if already v4.
+    movzx eax, word [rel vault_buf + 8]
+    cmp eax, VAULT_VERSION_V4
+    jne .ua_not_v4
+    lea rdi, [rel msg_already_v4]
+    call print_str
+    xor edi, edi
+    call exit
+.ua_not_v4:
+
+    ; Refuse if a hidden section is detected. Hidden sections in v3 live
+    ; after the main entries, marked by a specific magic. Conservative
+    ; check: if vault_file_size > 62 + walk_size_of_main_entries, bail.
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r15d, [rel vault_buf + 62]      ; entry count
+    lea rbx, [rel vault_buf + 66]       ; cursor
+    mov r12, 4                          ; main body bytes so far (entry_count)
+    xor r13, r13                        ; loop counter
+
+.ua_walk_main:
+    cmp r13d, r15d
+    jge .ua_walk_done
+    mov eax, [rbx]                      ; name_len
+    lea rcx, [rbx + 4]
+    add rcx, rax                        ; → enc_len field
+    mov edx, [rcx]                      ; enc_data_len
+    add rcx, 4
+    add rcx, IV_LEN
+    add rcx, rdx                        ; → next entry
+    sub rcx, rbx                        ; entry size
+    add r12, rcx
+    add rbx, rcx
+    inc r13
+    jmp .ua_walk_main
+.ua_walk_done:
+
+    mov rax, [rel vault_file_size]
+    sub rax, 62
+    cmp rax, r12
+    je .ua_no_hidden
+    lea rdi, [rel msg_hidden_v4_unsupported]
+    call print_str
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    mov edi, 1
+    call exit
+.ua_no_hidden:
+
+    ; ── In-place CTR-decrypt each entry's data slot ────────
+    mov r15d, [rel vault_buf + 62]
+    lea rbx, [rel vault_buf + 66]
+    xor r13, r13
+
+.ua_decrypt_loop:
+    cmp r13d, r15d
+    jge .ua_decrypt_done
+    mov eax, [rbx]                      ; name_len
+    lea r14, [rbx + 4]
+    add r14, rax                        ; → enc_len field
+    mov r12d, [r14]                     ; ct_len
+    add r14, 4                          ; → IV
+    mov rcx, r14                        ; iv ptr
+    add r14, IV_LEN                     ; → ct
+    ; ctr_crypt_raw(key=derived_key, iv=rcx, in=r14, len=r12, out=r14)
+    lea rdi, [rel derived_key]
+    mov rsi, rcx
+    mov rdx, r14
+    mov ecx, r12d
+    mov r8, r14
+    push rax
+    push r13
+    push r14
+    push r15
+    call ctr_crypt_raw
+    pop r15
+    pop r14
+    pop r13
+    pop rax
+    ; Advance rbx past this entry: 4 + name_len + 4 + 16 + ct_len
+    add rbx, 4
+    add rbx, rax
+    add rbx, 4
+    add rbx, 16
+    add rbx, r12
+    inc r13
+    jmp .ua_decrypt_loop
+.ua_decrypt_done:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    ; Switch version to V4 and seal
+    mov word [rel vault_buf + 8], VAULT_VERSION_V4
+    mov word [rel g_vault_version], VAULT_VERSION_V4
+
+    call recalc_and_save
+
+    call zero_sensitive
+
+    lea rdi, [rel msg_migrate_upgrade_aead_ok]
+    call print_str
+    xor edi, edi
+    call exit
+
 do_hidden:
+    ; Hidden vault operations are not supported on v4 vaults. The main-body
+    ; AEAD covers the entire body, but the hidden section has its own
+    ; password and key — that pairing has not been wired through the v4
+    ; AEAD path yet. Peek the on-disk version and refuse if v4.
+    call read_vault_file
+    test rax, rax
+    jz .hidden_no_v4_block
+    cmp rax, 10
+    jl .hidden_no_v4_block
+    movzx eax, word [rel vault_buf + 8]
+    cmp ax, VAULT_VERSION_V4
+    jne .hidden_no_v4_block
+    lea rdi, [rel msg_hidden_v4_blocked]
+    call print_str
+    mov edi, 1
+    call exit
+.hidden_no_v4_block:
+
     mov rax, [rel argc]
     cmp rax, 3
     jl .hidden_usage
@@ -6170,10 +8373,11 @@ do_hidden_init:
     call exit
 
 .hidden_mismatch:
-    lea rdi, [rel msg_mismatch]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_pw_mismatch]
+    lea rsi, [rel err_code_pw_mismatch]
+    lea rdx, [rel msg_mismatch]
+    mov ecx, 1
+    call emit_err
 
 ; ── vault hidden list — list hidden entries ──────────────────
 do_hidden_list:
@@ -6278,7 +8482,7 @@ do_hidden_add:
     lea rdx, [rel entry_data]
     mov rcx, r14
     lea r8, [rel crypt_buf]
-    call ctr_crypt
+    call ctr_crypt_raw              ; hidden vault keeps legacy CTR
 
     ; Append entry to hidden section
     call append_hidden_entry_and_save
@@ -6431,6 +8635,7 @@ do_hidden_rm:
 ; build_session_path — construct /tmp/.vault-session-<uid>
 build_session_path:
     push rbx
+    push r12
     lea rdi, [rel session_path]
     lea rsi, [rel session_path_prefix]
     call strcpy
@@ -6447,6 +8652,100 @@ build_session_path:
     pop rdi
     lea rsi, [rel numbuf]
     call strcpy
+    ; Append "-<hex16>" derived from the 16-byte salt (stable across saves).
+    ; Earlier scheme used the HMAC slot, which changed on every save and
+    ; orphaned the session stub. Salt is generated at init and never rewritten.
+    lea rdi, [rel session_path]
+    call strlen
+    lea rdi, [rel session_path]
+    add rdi, rax
+    mov byte [rdi], '-'
+    inc rdi
+    mov r12, rdi
+    lea rbx, [rel vault_buf + 10]
+    mov ecx, 8
+.bsp_hex_loop:
+    movzx eax, byte [rbx]
+    mov edx, eax
+    shr edx, 4
+    and edx, 0x0F
+    cmp edx, 10
+    jl .bsp_hi_d
+    add edx, 'a' - 10
+    jmp .bsp_hi_done
+.bsp_hi_d:
+    add edx, '0'
+.bsp_hi_done:
+    mov [r12], dl
+    inc r12
+    mov edx, eax
+    and edx, 0x0F
+    cmp edx, 10
+    jl .bsp_lo_d
+    add edx, 'a' - 10
+    jmp .bsp_lo_done
+.bsp_lo_d:
+    add edx, '0'
+.bsp_lo_done:
+    mov [r12], dl
+    inc r12
+    inc rbx
+    dec ecx
+    jnz .bsp_hex_loop
+    mov byte [r12], 0
+    pop r12
+    pop rbx
+    ret
+
+; build_keyring_desc — fill keyring_desc with "vault:session:<hex>" where
+; hex is the first 8 bytes of the vault_hmac slot in the file header,
+; lower-case hex. This makes the keyring slot unique per vault file so
+; multiple --vault-path vaults don't collide.
+build_keyring_desc:
+    push rbx
+    push r12
+    ; Copy prefix
+    lea rsi, [rel key_desc_prefix]
+    lea rdi, [rel keyring_desc]
+    call strcpy
+    ; Find end of prefix
+    lea rdi, [rel keyring_desc]
+    call strlen
+    lea r12, [rel keyring_desc]
+    add r12, rax
+    ; Emit 16 hex chars from the first 8 bytes of the salt (stable across saves)
+    lea rbx, [rel vault_buf + 10]
+    mov ecx, 8
+.bkd_loop:
+    movzx eax, byte [rbx]
+    mov edx, eax
+    shr edx, 4
+    and edx, 0x0F
+    cmp edx, 10
+    jl .bkd_hi_dig
+    add edx, 'a' - 10
+    jmp .bkd_hi_done
+.bkd_hi_dig:
+    add edx, '0'
+.bkd_hi_done:
+    mov [r12], dl
+    inc r12
+    mov edx, eax
+    and edx, 0x0F
+    cmp edx, 10
+    jl .bkd_lo_dig
+    add edx, 'a' - 10
+    jmp .bkd_lo_done
+.bkd_lo_dig:
+    add edx, '0'
+.bkd_lo_done:
+    mov [r12], dl
+    inc r12
+    inc rbx
+    dec ecx
+    jnz .bkd_loop
+    mov byte [r12], 0
+    pop r12
     pop rbx
     ret
 
@@ -6500,10 +8799,13 @@ try_load_session:
     cmp rax, [rel session_buf + SESSION_EXPIRY_OFFSET]
     ja .tls_invalid
 
+    ; Match by 16-byte salt (stable across saves). The remaining bytes of
+    ; the SESSION_VAULT_HMAC slot are written as zero on unlock; we only
+    ; compare the meaningful prefix.
     lea rdi, [rel session_buf + SESSION_VAULT_HMAC_OFFSET]
-    lea rsi, [rel vault_buf + 30]
-    mov ecx, HMAC_LEN
-    call memcmp
+    lea rsi, [rel vault_buf + 10]
+    mov ecx, SALT_LEN
+    call ct_memcmp
     test eax, eax
     jnz .tls_invalid
 
@@ -6517,15 +8819,24 @@ try_load_session:
     lea rdi, [rel session_buf + SESSION_KEYFILE_HASH_OFFSET]
     lea rsi, [rel keyfile_hash]
     mov ecx, KEY_LEN
-    call memcmp
+    call ct_memcmp
     test eax, eax
     jnz .tls_invalid
 
 .tls_load_key:
-    lea rsi, [rel session_buf + SESSION_KEY_OFFSET]
-    lea rdi, [rel derived_key]
-    mov ecx, KEY_LEN
-    rep movsb
+    ; Fetch derived_key from the kernel keyring by serial.
+    ; keyctl(KEYCTL_READ, serial, derived_key, 32) → returns 32 on success
+    ; (or larger if the key is longer; in practice always 32 here).
+    mov esi, [rel session_buf + SESSION_SERIAL_OFFSET]
+    test esi, esi
+    jz .tls_invalid
+    mov edi, KEYCTL_READ
+    lea rdx, [rel derived_key]
+    mov r10d, 32
+    mov eax, SYS_KEYCTL
+    syscall
+    cmp eax, 32
+    jne .tls_invalid               ; expired key, wrong uid, etc.
 
     mov byte [rel session_active], 1
     lea rdi, [rel session_buf]
@@ -6641,12 +8952,12 @@ open_hidden_vault:
     lea r8, [rel hidden_hmac]
     call hmac_sha256
 
-    ; Compare with stored HMAC (32 bytes before entry count)
+    ; Compare with stored HMAC — constant-time to deny timing side-channels.
     lea rdi, [rel hidden_hmac]
     mov rsi, [rel hidden_section_ptr]
     sub rsi, 32
     mov ecx, 32
-    call memcmp
+    call ct_memcmp
     test eax, eax
     jnz .ohv_hmac_fail
 
@@ -6660,16 +8971,18 @@ open_hidden_vault:
     ret
 
 .ohv_no_hidden:
-    lea rdi, [rel msg_no_vault]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_no_vault]
+    lea rsi, [rel err_code_no_vault]
+    lea rdx, [rel msg_no_vault]
+    mov ecx, 1
+    call emit_err
 
 .ohv_hmac_fail:
-    lea rdi, [rel msg_hmac_fail]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_auth_failed]
+    lea rsi, [rel err_code_auth_failed]
+    lea rdx, [rel msg_hmac_fail]
+    mov ecx, 1
+    call emit_err
 
 ; find_hidden_entry — find entry by name in hidden section
 ;   rdi = name (null-terminated)
@@ -6764,7 +9077,7 @@ decrypt_hidden_entry:
     pop rdx
     mov ecx, r12d
     lea r8, [rel entry_data]
-    call ctr_crypt
+    call ctr_crypt_raw              ; hidden vault keeps legacy CTR
 
     ; Parse fields
     lea rsi, [rel entry_data]
@@ -6976,10 +9289,11 @@ load_keyfile_hash:
     call read_file
     test eax, eax
     jnz .lkh_loaded
-    lea rdi, [rel msg_keyfile_required]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_keyfile]
+    lea rsi, [rel err_code_keyfile]
+    lea rdx, [rel msg_keyfile_required]
+    mov ecx, 1
+    call emit_err
 
 .lkh_loaded:
     lea rdi, [rel keyfile_buf]
@@ -7240,6 +9554,32 @@ open_vault:
 
     mov [rel vault_file_size], rax
 
+    ; Bounds guard: minimum file size is 66 bytes for v1-v3 (header) or
+    ; 78 bytes for v4 (62 header + 16 tag, empty body).
+    cmp rax, 66
+    jl .ov_corrupt
+
+    ; v4 vaults have ciphertext at offset 62 — defer entry_count sanity to
+    ; after AEAD decrypt. Skip the upper-bound check for v4.
+    movzx ecx, word [rel vault_buf + 8]
+    cmp ecx, VAULT_VERSION_V4
+    je .ov_skip_count_check
+
+    ; Reject claimed entry counts that obviously overrun the file.
+    ; A minimum per-entry overhead is 4 (name_len) + 1 (name byte) + 4 (enc_len)
+    ; + 16 (IV) + 0 (ciphertext may be empty) = 25 bytes. So an upper bound
+    ; on entry_count is (file_size - 66) / 25 + 1. Use this as a sanity gate.
+    mov ecx, [rel vault_buf + 62]   ; entry count
+    mov rax, [rel vault_file_size]
+    sub rax, 66
+    add rax, 24                      ; round up: (size-66+24)/25
+    mov r8, 25
+    xor edx, edx
+    div r8                           ; rax = upper bound on entry count
+    cmp ecx, eax
+    ja .ov_corrupt
+.ov_skip_count_check:
+
     ; Check for active session first
     call try_load_session
     test eax, eax
@@ -7274,8 +9614,12 @@ open_vault:
     movzx eax, word [rsi + 8]
     cmp ax, VAULT_VERSION_ARGON2
     je .ov_argon2
+    cmp ax, VAULT_VERSION_V3
+    je .ov_argon2
+    cmp ax, VAULT_VERSION_V4
+    je .ov_argon2
 
-    ; PBKDF2-SHA256
+    ; PBKDF2-SHA256 (legacy v1)
     lea rdi, [rel master_pw]
     mov rsi, r12
     lea rdx, [rel vault_salt]
@@ -7306,11 +9650,20 @@ open_vault:
 .no_keyfile_apply:
 
 .ov_session_loaded:
-    ; Verify HMAC
-    ; Stored HMAC is at offset 30 (8+2+16+4)
-    ; Data to verify starts at offset 62 (30+32)
+    ; Verify integrity. Scope depends on version:
+    ;   v1/v2: HMAC covers [62..end]
+    ;   v3:    HMAC covers entire file with the HMAC slot [30..62) zeroed.
+    ;   v4:    ChaCha20-Poly1305 AEAD over body, AAD = header[0..62].
+    movzx eax, word [rel vault_buf + 8]
+    mov   [rel g_vault_version], ax
+    cmp ax, VAULT_VERSION_V4
+    je .ov_verify_v4
+    cmp eax, VAULT_VERSION_V3
+    je .ov_verify_v3
+
+    ; Legacy v1/v2 scope: [62..end]
     mov rax, [rel vault_file_size]
-    sub rax, 62             ; data length
+    sub rax, 62
     lea rdi, [rel derived_key]
     mov rsi, 32
     lea rdx, [rel vault_buf]
@@ -7318,13 +9671,39 @@ open_vault:
     mov rcx, rax
     lea r8, [rel vault_hmac]
     call hmac_sha256
+    jmp .ov_verify_compare
 
-    ; Compare with stored HMAC
+.ov_verify_v3:
+    ; Save stored HMAC slot bytes, zero them, HMAC the whole file, restore.
+    lea rdi, [rel saved_hmac_slot]
+    lea rsi, [rel vault_buf + 30]
+    mov ecx, 32
+    rep movsb
+    lea rdi, [rel vault_buf + 30]
+    mov ecx, 32
+    xor al, al
+    rep stosb
+    ; HMAC over [0..file_size]
+    mov rax, [rel vault_file_size]
+    lea rdi, [rel derived_key]
+    mov rsi, 32
+    lea rdx, [rel vault_buf]
+    mov rcx, rax
+    lea r8, [rel vault_hmac]
+    call hmac_sha256
+    ; Restore the slot bytes for the compare below
+    lea rdi, [rel vault_buf + 30]
+    lea rsi, [rel saved_hmac_slot]
+    mov ecx, 32
+    rep movsb
+
+.ov_verify_compare:
+    ; Compare with stored HMAC — constant-time to deny timing side-channels.
     lea rdi, [rel vault_hmac]
     lea rsi, [rel vault_buf]
     add rsi, 30
     mov ecx, 32
-    call memcmp
+    call ct_memcmp
     test eax, eax
     jnz .hmac_fail
 
@@ -7332,18 +9711,39 @@ open_vault:
     pop r12
     ret
 
+.ov_verify_v4:
+    ; AEAD-open the body in place. open_main_body_v4 returns 0 on success,
+    ; -1 on tag mismatch.
+    call open_main_body_v4
+    test rax, rax
+    jnz .hmac_fail
+    pop r15
+    pop r12
+    ret
+
 .no_vault_helper:
-    lea rdi, [rel msg_no_vault]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_no_vault]
+    lea rsi, [rel err_code_no_vault]
+    lea rdx, [rel msg_no_vault]
+    mov ecx, 1
+    call emit_err
+
+.ov_corrupt:
+    ; File too small or self-inconsistent — report as auth-failed (we don't want
+    ; to leak whether the file looks tampered vs genuinely truncated).
+    lea rdi, [rel err_msg_auth_failed]
+    lea rsi, [rel err_code_auth_failed]
+    lea rdx, [rel msg_hmac_fail]
+    mov ecx, 1
+    call emit_err
 
 .hmac_fail:
     call zero_sensitive
-    lea rdi, [rel msg_hmac_fail]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_auth_failed]
+    lea rsi, [rel err_code_auth_failed]
+    lea rdx, [rel msg_hmac_fail]
+    mov ecx, 1
+    call emit_err
 
 ; read_vault_file — read vault file into vault_buf
 ;   Returns: rax = bytes read (0 if file doesn't exist)
@@ -7386,30 +9786,27 @@ find_entry:
     push rcx
     push rsi
 
-    ; Compare name
-    mov eax, [rsi]          ; name_len
-    add rsi, 4              ; name data
+    ; Compare name: must match BOTH length and bytes exactly.
+    ; Bug fix: previous implementation accidentally used strlen(search) as the
+    ; compare length, causing "foo" to exact-match "foo-bar". Now we first
+    ; check lengths are equal, then memcmp.
+    mov eax, [rsi]          ; entry name_len (from header)
+    add rsi, 4              ; rsi -> entry name data
+    push rax                ; save entry name_len for memcmp count
     mov rdi, r12
-    call strlen
-    cmp eax, [rsp]          ; compare lengths... wait, name_len is at [rsp] entry start
-    ; Let me redo: rsi = name_data, eax = name_len from header
-    mov edx, eax            ; name_len
-    push rdx
-    mov rdi, r12
-    mov rcx, rdx
-    call memcmp_n           ; compare rcx bytes of rdi vs rsi
-    pop rdx
+    call strlen             ; eax = strlen(search)
+    pop rdx                 ; rdx = entry name_len
+    cmp eax, edx
+    jne .fe_next
+    ; Lengths match — compare bytes.
+    mov rdi, r12            ; search name
+    mov rcx, rdx            ; length to compare
+    call memcmp_n
     test eax, eax
     jnz .fe_next
 
-    ; Also check that the search name length matches
-    mov rdi, r12
-    call strlen
-    cmp eax, edx
-    jne .fe_next
-
     ; Found! Return pointer to entry start
-    pop rax                 ; entry start
+    pop rax                 ; entry start (from push rsi above)
     pop rcx
     jmp .fe_done
 
@@ -7617,9 +10014,19 @@ recalc_and_save:
     sub rdx, rax
     mov [rel vault_file_size], rdx
 
-    ; HMAC over data from offset 62 to end
-    mov rax, rdx
-    sub rax, 62             ; data length
+    ; Integrity by version:
+    ;   v1/v2: HMAC-SHA256 over [62..end]
+    ;   v3:    HMAC-SHA256 over full file with HMAC slot zeroed
+    ;   v4:    ChaCha20-Poly1305 AEAD over body, header=AAD
+    movzx eax, word [rel vault_buf + 8]
+    cmp eax, VAULT_VERSION_V4
+    je .rs_aead_v4
+    cmp eax, VAULT_VERSION_V3
+    je .rs_hmac_v3
+
+    ; Legacy: HMAC over data from offset 62 to end
+    mov rax, [rel vault_file_size]
+    sub rax, 62
     lea rdi, [rel derived_key]
     mov rsi, 32
     lea rdx, [rel vault_buf]
@@ -7627,7 +10034,23 @@ recalc_and_save:
     mov rcx, rax
     lea r8, [rel vault_hmac]
     call hmac_sha256
+    jmp .rs_hmac_done
 
+.rs_hmac_v3:
+    ; Zero HMAC slot, HMAC entire file
+    lea rdi, [rel vault_buf + 30]
+    mov ecx, 32
+    xor al, al
+    rep stosb
+    mov rax, [rel vault_file_size]
+    lea rdi, [rel derived_key]
+    mov rsi, 32
+    lea rdx, [rel vault_buf]
+    mov rcx, rax
+    lea r8, [rel vault_hmac]
+    call hmac_sha256
+
+.rs_hmac_done:
     ; Copy HMAC to header at offset 30
     lea rdi, [rel vault_buf]
     add rdi, 30
@@ -7635,6 +10058,7 @@ recalc_and_save:
     mov ecx, 32
     rep movsb
 
+.rs_write_file:
     ; Write file
     lea rdi, [rel vault_path]
     lea rsi, [rel vault_buf]
@@ -7645,6 +10069,15 @@ recalc_and_save:
 
     pop rbx
     ret
+
+.rs_aead_v4:
+    ; vault_file_size currently = 62 + plain_len (header + plaintext body).
+    ; Compute plain_len, then seal_main_body_v4 generates nonce, encrypts in
+    ; place, appends tag, and updates vault_file_size to 62 + plain_len + 16.
+    mov rdi, [rel vault_file_size]
+    sub rdi, 62                      ; plain_len
+    call seal_main_body_v4
+    jmp .rs_write_file
 
 ; zero_sensitive — zero all sensitive buffers
 zero_sensitive:
@@ -8493,6 +10926,345 @@ print_n:
     syscall
     ret
 
+; print_err — write a null-terminated C-string to STDERR (fd 2)
+;   rdi = buffer
+print_err:
+    push rdi
+    call strlen
+    mov rdx, rax
+    pop rsi
+    mov edi, STDERR
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+; print_char_err — write single character to STDERR
+;   al = character
+print_char_err:
+    push rax
+    mov rsi, rsp
+    mov edx, 1
+    mov edi, STDERR
+    mov eax, SYS_WRITE
+    syscall
+    pop rax
+    ret
+
+; print_json_quoted_err — like print_json_quoted but writes to STDERR
+;   rdi = null-terminated string
+print_json_quoted_err:
+    push rbx
+    mov rbx, rdi
+    mov al, '"'
+    call print_char_err
+.pjqe_loop:
+    mov al, [rbx]
+    test al, al
+    jz .pjqe_done
+    cmp al, '"'
+    je .pjqe_quote
+    cmp al, 92
+    je .pjqe_bs
+    cmp al, 10
+    je .pjqe_nl
+    cmp al, 13
+    je .pjqe_cr
+    cmp al, 9
+    je .pjqe_tab
+    cmp al, 0x20
+    jl .pjqe_skip            ; drop other control chars rather than emit invalid JSON
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_quote:
+    mov al, 92
+    call print_char_err
+    mov al, '"'
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_bs:
+    mov al, 92
+    call print_char_err
+    mov al, 92
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_nl:
+    mov al, 92
+    call print_char_err
+    mov al, 'n'
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_cr:
+    mov al, 92
+    call print_char_err
+    mov al, 'r'
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_tab:
+    mov al, 92
+    call print_char_err
+    mov al, 't'
+    call print_char_err
+    jmp .pjqe_next
+.pjqe_skip:
+.pjqe_next:
+    inc rbx
+    jmp .pjqe_loop
+.pjqe_done:
+    mov al, '"'
+    call print_char_err
+    pop rbx
+    ret
+
+; argv_scan_exact_mode — return 1 in eax if --raw, --json, or --exact is in argv.
+; Used to force exact (non-fuzzy) entry lookup whenever the caller is an agent
+; (i.e. asked for structured output or explicit exact matching).
+argv_scan_exact_mode:
+    push rbx
+    push r12
+    push r13
+    xor eax, eax
+    mov r12, [rel argc]
+    mov r13, 1
+.asem_loop:
+    cmp r13, r12
+    jge .asem_done
+    mov rax, [rel argv]
+    mov rdi, [rax + r13*8]
+    test rdi, rdi
+    jz .asem_next
+    lea rsi, [rel raw_flag]
+    call strcmp
+    test eax, eax
+    jz .asem_yes
+    mov rax, [rel argv]
+    mov rdi, [rax + r13*8]
+    lea rsi, [rel json_flag]
+    call strcmp
+    test eax, eax
+    jz .asem_yes
+    mov rax, [rel argv]
+    mov rdi, [rax + r13*8]
+    lea rsi, [rel exact_flag]
+    call strcmp
+    test eax, eax
+    jz .asem_yes
+.asem_next:
+    inc r13
+    jmp .asem_loop
+.asem_yes:
+    mov eax, 1
+    jmp .asem_out
+.asem_done:
+    xor eax, eax
+.asem_out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; argv_scan_raw_flag — return 1 in eax if --raw appears in argv[1..argc-1]
+argv_scan_raw_flag:
+    push rbx
+    push r12
+    push r13
+    xor eax, eax
+    mov r12, [rel argc]
+    mov r13, 1
+.asrf_loop:
+    cmp r13, r12
+    jge .asrf_done
+    mov rax, [rel argv]
+    mov rdi, [rax + r13*8]
+    test rdi, rdi
+    jz .asrf_next
+    lea rsi, [rel raw_flag]
+    call strcmp
+    test eax, eax
+    jnz .asrf_next
+    mov eax, 1
+    jmp .asrf_out
+.asrf_next:
+    inc r13
+    jmp .asrf_loop
+.asrf_done:
+    xor eax, eax
+.asrf_out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; emit_ok_simple — emit a success token then exit 0.
+;   rdi = legacy human-readable message (used in plain mode)
+; Decision: --json → {"ok":true}; --raw → "ok"; otherwise human message.
+emit_ok_simple:
+    push rdi
+    cmp byte [rel output_json], 0
+    jne .eos_json
+    call argv_scan_json_flag
+    test eax, eax
+    jnz .eos_json
+    cmp byte [rel output_raw], 0
+    jne .eos_raw
+    call argv_scan_raw_flag
+    test eax, eax
+    jnz .eos_raw
+    pop rdi
+    call print_str
+    xor edi, edi
+    call exit
+.eos_raw:
+    pop rdi
+    lea rdi, [rel msg_ok_raw]
+    call print_str
+    xor edi, edi
+    call exit
+.eos_json:
+    pop rdi
+    lea rdi, [rel json_ok_true]
+    call print_str
+    xor edi, edi
+    call exit
+
+; argv_scan_json_flag — return 1 in eax if --json appears in argv[1..argc-1]
+argv_scan_json_flag:
+    push rbx
+    push r12
+    push r13
+    xor eax, eax
+    mov r12, [rel argc]
+    mov r13, 1
+.asjf_loop:
+    cmp r13, r12
+    jge .asjf_done
+    mov rax, [rel argv]
+    mov rdi, [rax + r13*8]
+    test rdi, rdi
+    jz .asjf_next
+    lea rsi, [rel json_flag]
+    call strcmp
+    test eax, eax
+    jnz .asjf_next
+    mov eax, 1
+    jmp .asjf_out
+.asjf_next:
+    inc r13
+    jmp .asjf_loop
+.asjf_done:
+    xor eax, eax
+.asjf_out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; emit_err — emit a structured or human-readable error to STDERR, then exit.
+;   rdi = short error message (used inside JSON envelope; no trailing newline)
+;   rsi = error code slug (machine-stable)
+;   rdx = pointer to legacy human-readable message (may be NULL — falls back to rdi+newline)
+;   ecx = exit code
+emit_err:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi             ; short msg
+    mov r12, rsi             ; code slug
+    mov r13, rdx             ; legacy human msg
+    mov r14d, ecx            ; exit code
+
+    ; Decide JSON vs plain. Prefer the global flag if already set; otherwise scan argv.
+    cmp byte [rel output_json], 0
+    jne .emit_json
+    call argv_scan_json_flag
+    test eax, eax
+    jnz .emit_json
+
+    ; Plain path: human-readable text to STDERR.
+    test r13, r13
+    jz .emit_plain_short
+    mov rdi, r13
+    call print_err
+    jmp .emit_exit
+.emit_plain_short:
+    mov rdi, rbx
+    call print_err
+    mov al, 10
+    call print_char_err
+    jmp .emit_exit
+
+.emit_json:
+    lea rdi, [rel json_err_prefix]
+    call print_err
+    mov rdi, r12
+    call print_err           ; code slug (already JSON-safe: ascii lowercase/underscore)
+    lea rdi, [rel json_err_middle]
+    call print_err
+    ; Emit the short message as a JSON string body (without surrounding quotes —
+    ; print_json_quoted_err adds them, so use a manual inline loop instead).
+    push rbx
+    mov rbx, rbx             ; pointer to message
+.emit_json_body:
+    mov al, [rbx]
+    test al, al
+    jz .emit_json_body_done
+    cmp al, '"'
+    je .emit_json_q
+    cmp al, 92
+    je .emit_json_bs
+    cmp al, 10
+    je .emit_json_nl
+    cmp al, 13
+    je .emit_json_cr
+    cmp al, 9
+    je .emit_json_tab
+    cmp al, 0x20
+    jl .emit_json_skip
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_q:
+    mov al, 92
+    call print_char_err
+    mov al, '"'
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_bs:
+    mov al, 92
+    call print_char_err
+    mov al, 92
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_nl:
+    mov al, 92
+    call print_char_err
+    mov al, 'n'
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_cr:
+    mov al, 92
+    call print_char_err
+    mov al, 'r'
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_tab:
+    mov al, 92
+    call print_char_err
+    mov al, 't'
+    call print_char_err
+    jmp .emit_json_next
+.emit_json_skip:
+.emit_json_next:
+    inc rbx
+    jmp .emit_json_body
+.emit_json_body_done:
+    pop rbx
+    lea rdi, [rel json_err_suffix]
+    call print_err
+
+.emit_exit:
+    mov edi, r14d
+    call exit
+
 ; print_char — print single character
 ;   al = character
 print_char:
@@ -8656,22 +11428,37 @@ parse_output_flags:
     call strcmp
     pop r12
     test eax, eax
-    jnz .pof_bad
+    jnz .pof_check_exact
     cmp byte [rel output_raw], 0
     jne .pof_conflict
     mov byte [rel output_json], 1
     inc r12
     jmp .pof_loop
+.pof_check_exact:
+    mov rax, [rel argv]
+    mov rdi, [rax + r12*8]
+    lea rsi, [rel exact_flag]
+    push r12
+    call strcmp
+    pop r12
+    test eax, eax
+    jnz .pof_bad
+    ; --exact composes with --raw/--json; no conflict, no state byte needed
+    ; (lookup mode is recomputed from argv at call sites via argv_scan_exact_mode)
+    inc r12
+    jmp .pof_loop
 .pof_bad:
-    lea rdi, [rel msg_output_opt]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_bad_output]
+    lea rsi, [rel err_code_bad_output]
+    lea rdx, [rel msg_output_opt]
+    mov ecx, 2
+    call emit_err
 .pof_conflict:
-    lea rdi, [rel msg_output_conflict]
-    call print_str
-    mov edi, 1
-    call exit
+    lea rdi, [rel err_msg_output_conflict]
+    lea rsi, [rel err_code_output_conflict]
+    lea rdx, [rel msg_output_conflict]
+    mov ecx, 2
+    call emit_err
 .pof_done:
     pop r12
     ret
@@ -8823,6 +11610,29 @@ memcmp:
     pop rbx
     ret
 
+; ct_memcmp — constant-time byte compare. Accumulates XOR-difference into al
+; with no early exit, so timing reveals nothing about which byte mismatched.
+;   rdi = a, rsi = b, ecx = length
+;   Returns eax = 0 iff equal, nonzero otherwise.
+; Use this for any secret-vs-supplied compare (HMAC tags, keyfile hashes).
+ct_memcmp:
+    push rbx
+    xor eax, eax              ; accumulator
+    test ecx, ecx
+    jz .ctc_done
+.ctc_loop:
+    mov bl, [rdi]
+    xor bl, [rsi]
+    or al, bl
+    inc rdi
+    inc rsi
+    dec ecx
+    jnz .ctc_loop
+.ctc_done:
+    movzx eax, al
+    pop rbx
+    ret
+
 ; memcmp_n — compare rcx bytes (same as memcmp but uses rcx)
 memcmp_n:
     jmp memcmp
@@ -8844,7 +11654,8 @@ read_line:
     push r14
     mov r12, rsi            ; output buffer
     mov r13d, edx           ; max len
-    call print_str
+    ; Prompts go to STDERR so stdout stays clean for piping.
+    call print_err
 
     ; Read one byte at a time until newline or EOF
     xor r14d, r14d          ; bytes read
@@ -8918,9 +11729,9 @@ read_password:
     call read_line
     push rax                ; save length
 
-    ; Print newline (since echo was off)
+    ; Print newline (since echo was off) — to STDERR, mirroring the prompt.
     lea rdi, [rel msg_newline]
-    call print_str
+    call print_err
 
     ; Restore terminal
     mov edi, STDIN
@@ -9058,11 +11869,27 @@ write_file:
 
 ; get_random — fill buffer with random bytes
 ;   rdi = buffer, esi = count
+; get_random(rdi=buf, rsi=count)
+; Aborts the process on short read or syscall error — nonces / keys / IVs
+; built on partial randomness would silently break ChaCha20-Poly1305
+; (nonce reuse with the same key reveals plaintext-XOR and breaks the MAC).
+; SysV syscall ABI preserves rsi, so we compare rax == rsi after the call.
 get_random:
-    mov edx, 0              ; flags
-    mov eax, SYS_GETRANDOM
+    xor     edx, edx                    ; flags = 0
+    mov     eax, SYS_GETRANDOM
     syscall
+    cmp     rax, rsi
+    jne     .gr_fail
     ret
+.gr_fail:
+    mov     edi, 2                      ; stderr
+    lea     rsi, [rel err_no_random]
+    mov     edx, ERR_NO_RANDOM_LEN
+    mov     eax, SYS_WRITE
+    syscall
+    mov     edi, 1
+    mov     eax, SYS_EXIT
+    syscall
 
 ; get_dir_part — find last / in path, return offset
 ;   rdi = path

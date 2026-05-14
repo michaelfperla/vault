@@ -1,7 +1,7 @@
 ASM = nasm
 LD = ld
 ASMFLAGS = -f elf64
-LDFLAGS = -s
+LDFLAGS = -s -z noexecstack
 
 TARGET = vault
 SRC = vault.asm
